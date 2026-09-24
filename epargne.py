@@ -19,9 +19,11 @@ except ImportError:
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
+    from psycopg2.pool import ThreadedConnectionPool
 except ImportError:
     psycopg2 = None
     RealDictCursor = None
+    ThreadedConnectionPool = None
 
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib import colors
@@ -564,20 +566,57 @@ def use_supabase():
     return configured and psycopg2 is not None
 
 
+@st.cache_resource(show_spinner=False)
+def get_pg_pool():
+    """
+    Pool PostgreSQL partagé par l'application.
+    Évite d'ouvrir une nouvelle connexion Supabase à chaque requête.
+    """
+    if not use_supabase() or ThreadedConnectionPool is None:
+        return None
+
+    dsn = postgres_dsn()
+    return ThreadedConnectionPool(
+        minconn=1,
+        maxconn=5,
+        dsn=dsn,
+        cursor_factory=RealDictCursor,
+        connect_timeout=8,
+        application_name="epargne-etudiant",
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
+    )
+
+
 @contextmanager
 def db():
-    """Connexion PostgreSQL Supabase si psycopg2 est installé, sinon SQLite."""
+    """
+    Connexion PostgreSQL Supabase réutilisée via un pool.
+    SQLite reste disponible uniquement comme secours local.
+    """
     if use_supabase():
-        raw_con = psycopg2.connect(postgres_dsn(), cursor_factory=RealDictCursor)
+        pool = get_pg_pool()
+        if pool is None:
+            raise RuntimeError("Le pool PostgreSQL n'est pas disponible.")
+
+        raw_con = pool.getconn()
         con = PostgresConnectionAdapter(raw_con)
         try:
             yield con
-            con.commit()
+            raw_con.commit()
         except Exception:
-            con.rollback()
+            raw_con.rollback()
             raise
         finally:
-            con.close()
+            # Nettoyage de la transaction avant de remettre la connexion
+            # dans le pool. On ne ferme surtout pas la connexion ici.
+            try:
+                raw_con.rollback()
+            except Exception:
+                pass
+            pool.putconn(raw_con)
     else:
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
@@ -589,7 +628,6 @@ def db():
             raise
         finally:
             con.close()
-
 
 def sql(query):
     """Adapte les placeholders SQLite (?) vers PostgreSQL (%s)."""
@@ -684,112 +722,101 @@ def migrate_database(con):
         )
 
 
+@st.cache_resource(show_spinner=False)
 def create_supabase_schema():
-    """Crée automatiquement toutes les tables Supabase au démarrage."""
+    """
+    Prépare le schéma Supabase une seule fois par processus Streamlit.
+
+    Correction importante :
+    l'ancienne version créait l'index member_username AVANT d'ajouter
+    member_username aux anciennes tables members. Si la table members
+    existait déjà sans cette colonne, PostgreSQL arrêtait toute l'initialisation.
+    """
     if not use_supabase():
         return
 
-    statements = [
-        """
-        CREATE TABLE IF NOT EXISTS public.admins (
-            id BIGSERIAL PRIMARY KEY,
-            username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            full_name TEXT NOT NULL,
-            active BOOLEAN NOT NULL DEFAULT TRUE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS public.members (
-            id BIGSERIAL PRIMARY KEY,
-            full_name TEXT NOT NULL,
-            phone TEXT,
-            monthly_target NUMERIC(14,2) NOT NULL DEFAULT 0,
-            notes TEXT,
-            active BOOLEAN NOT NULL DEFAULT TRUE,
-            member_username TEXT UNIQUE,
-            member_password TEXT,
-            member_login_active BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS public.contributions (
-            id BIGSERIAL PRIMARY KEY,
-            member_id BIGINT NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
-            payment_date DATE NOT NULL,
-            month_label TEXT,
-            amount NUMERIC(14,2) NOT NULL,
-            note TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS public.loans (
-            id BIGSERIAL PRIMARY KEY,
-            member_id BIGINT NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
-            loan_date DATE NOT NULL,
-            principal NUMERIC(14,2) NOT NULL,
-            interest_rate NUMERIC(8,4) NOT NULL DEFAULT 0,
-            total_due NUMERIC(14,2) NOT NULL DEFAULT 0,
-            duration_months INTEGER NOT NULL DEFAULT 1,
-            first_due_date DATE NOT NULL,
-            status TEXT NOT NULL DEFAULT 'Actif',
-            note TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS public.loan_installments (
-            id BIGSERIAL PRIMARY KEY,
-            loan_id BIGINT NOT NULL REFERENCES public.loans(id) ON DELETE CASCADE,
-            installment_number INTEGER NOT NULL DEFAULT 1,
-            due_date DATE NOT NULL,
-            amount_due NUMERIC(14,2) NOT NULL DEFAULT 0,
-            amount_paid NUMERIC(14,2) NOT NULL DEFAULT 0,
-            payment_date DATE,
-            note TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """,
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_members_member_username_unique
-        ON public.members(member_username)
-        WHERE member_username IS NOT NULL
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_contributions_member_date
-        ON public.contributions(member_id, payment_date DESC)
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_loans_member_date
-        ON public.loans(member_id, loan_date DESC)
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_installments_loan_due
-        ON public.loan_installments(loan_id, due_date)
-        """,
-    ]
-
     with db() as con:
         cur = con.cursor()
-        for statement in statements:
+
+        # ------------------------------------------------------------
+        # 1. Création des tables si elles n'existent pas.
+        # ------------------------------------------------------------
+        table_statements = [
+            """
+            CREATE TABLE IF NOT EXISTS public.admins (
+                id BIGSERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                full_name TEXT NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS public.members (
+                id BIGSERIAL PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                phone TEXT,
+                monthly_target NUMERIC(14,2) NOT NULL DEFAULT 0,
+                notes TEXT,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                member_username TEXT UNIQUE,
+                member_password TEXT,
+                member_login_active BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS public.contributions (
+                id BIGSERIAL PRIMARY KEY,
+                member_id BIGINT NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
+                payment_date DATE NOT NULL,
+                month_label TEXT,
+                amount NUMERIC(14,2) NOT NULL,
+                note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS public.loans (
+                id BIGSERIAL PRIMARY KEY,
+                member_id BIGINT NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
+                loan_date DATE NOT NULL,
+                principal NUMERIC(14,2) NOT NULL,
+                interest_rate NUMERIC(8,4) NOT NULL DEFAULT 0,
+                total_due NUMERIC(14,2) NOT NULL DEFAULT 0,
+                duration_months INTEGER NOT NULL DEFAULT 1,
+                first_due_date DATE NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Actif',
+                note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS public.loan_installments (
+                id BIGSERIAL PRIMARY KEY,
+                loan_id BIGINT NOT NULL REFERENCES public.loans(id) ON DELETE CASCADE,
+                installment_number INTEGER NOT NULL DEFAULT 1,
+                due_date DATE NOT NULL,
+                amount_due NUMERIC(14,2) NOT NULL DEFAULT 0,
+                amount_paid NUMERIC(14,2) NOT NULL DEFAULT 0,
+                payment_date DATE,
+                note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+        ]
+
+        for statement in table_statements:
             cur.execute(statement)
 
-        # Administrateur initial.
-        cur.execute(
-            """
-            INSERT INTO public.admins (username, password, full_name)
-            VALUES (?, ?, ?)
-            ON CONFLICT (username) DO NOTHING
-            """,
-            (ADMIN_USERNAME, ADMIN_PASSWORD, ADMIN_NAME),
-        )
-
-        # Migration douce : ajoute les colonnes qui pourraient manquer
-        # si les tables existaient déjà dans une ancienne version.
+        # ------------------------------------------------------------
+        # 2. Migration douce des anciennes tables.
+        # IMPORTANT : les colonnes sont ajoutées AVANT les index.
+        # ------------------------------------------------------------
         alter_statements = [
+            # members
+            "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS full_name TEXT",
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS phone TEXT",
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS monthly_target NUMERIC(14,2) DEFAULT 0",
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS notes TEXT",
@@ -799,12 +826,18 @@ def create_supabase_schema():
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS member_login_active BOOLEAN DEFAULT FALSE",
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
 
+            # contributions
+            "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS member_id BIGINT",
             "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS payment_date DATE",
             "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS month_label TEXT",
+            "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS amount NUMERIC(14,2) DEFAULT 0",
             "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS note TEXT",
             "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
 
+            # loans
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS member_id BIGINT",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS loan_date DATE",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS principal NUMERIC(14,2) DEFAULT 0",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS interest_rate NUMERIC(8,4) DEFAULT 0",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS total_due NUMERIC(14,2) DEFAULT 0",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS duration_months INTEGER DEFAULT 1",
@@ -815,6 +848,8 @@ def create_supabase_schema():
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS total_interest_rate NUMERIC(8,4) DEFAULT 0",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS installments_count INTEGER DEFAULT 1",
 
+            # loan_installments
+            "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS loan_id BIGINT",
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS installment_number INTEGER DEFAULT 1",
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS due_date DATE",
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS amount_due NUMERIC(14,2) DEFAULT 0",
@@ -828,48 +863,116 @@ def create_supabase_schema():
         ]
 
         for statement in alter_statements:
-            try:
-                cur.execute(statement)
-            except Exception:
-                # Une colonne peut être incompatible avec une ancienne structure.
-                # Les tables principales ont déjà été créées avec le bon schéma.
-                con.rollback()
-                cur = con.cursor()
+            cur.execute(statement)
 
-        # Reprise des anciennes colonnes si une base Supabase existait déjà.
-        # On ne remplace jamais une valeur moderne déjà renseignée.
+        # Valeurs par défaut pour les anciennes lignes.
+        cur.execute("""
+            UPDATE public.members
+            SET active = COALESCE(active, TRUE),
+                monthly_target = COALESCE(monthly_target, 0),
+                member_login_active = COALESCE(member_login_active, FALSE)
+            WHERE active IS NULL
+               OR monthly_target IS NULL
+               OR member_login_active IS NULL
+        """)
+
+        # ------------------------------------------------------------
+        # 3. Index APRES création/migration des colonnes.
+        # ------------------------------------------------------------
+        index_statements = [
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_members_member_username_unique
+            ON public.members(member_username)
+            WHERE member_username IS NOT NULL
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_members_active_name
+            ON public.members(active, full_name)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_contributions_member_date
+            ON public.contributions(member_id, payment_date DESC)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_loans_member_date
+            ON public.loans(member_id, loan_date DESC)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_installments_loan_due
+            ON public.loan_installments(loan_id, due_date)
+            """,
+        ]
+
+        for statement in index_statements:
+            cur.execute(statement)
+
+        # ------------------------------------------------------------
+        # 4. Administrateur initial.
+        # ------------------------------------------------------------
+        cur.execute(
+            """
+            INSERT INTO public.admins (username, password, full_name)
+            VALUES (?, ?, ?)
+            ON CONFLICT (username) DO NOTHING
+            """,
+            (ADMIN_USERNAME, ADMIN_PASSWORD, ADMIN_NAME),
+        )
+
+        # ------------------------------------------------------------
+        # 5. Reprise des anciennes colonnes de prêts.
+        # Une seule exécution au démarrage grâce au cache resource.
+        # ------------------------------------------------------------
         try:
+            # SAVEPOINT : une éventuelle erreur de compatibilité legacy
+            # ne doit pas annuler les CREATE TABLE / ALTER TABLE / INDEX.
+            cur.execute("SAVEPOINT legacy_upgrade")
             cur.execute("""
                 UPDATE public.loans
                 SET interest_rate = CASE
-                        WHEN COALESCE(interest_rate, 0) = 0 THEN COALESCE(total_interest_rate, 0)
-                        ELSE interest_rate END,
+                        WHEN COALESCE(interest_rate, 0) = 0
+                        THEN COALESCE(total_interest_rate, 0)
+                        ELSE interest_rate
+                    END,
                     duration_months = CASE
-                        WHEN COALESCE(duration_months, 0) <= 0 THEN COALESCE(installments_count, 1)
-                        ELSE duration_months END,
+                        WHEN COALESCE(duration_months, 0) <= 0
+                        THEN COALESCE(installments_count, 1)
+                        ELSE duration_months
+                    END,
                     total_due = CASE
                         WHEN COALESCE(total_due, 0) = 0
                         THEN principal * (1 + COALESCE(total_interest_rate, 0) / 100.0)
-                        ELSE total_due END,
+                        ELSE total_due
+                    END,
                     status = COALESCE(NULLIF(status, ''), 'Actif')
             """)
+
             cur.execute("""
                 UPDATE public.loan_installments
                 SET amount_due = CASE
-                        WHEN COALESCE(amount_due, 0) = 0 THEN COALESCE(expected_amount, 0)
-                        ELSE amount_due END,
+                        WHEN COALESCE(amount_due, 0) = 0
+                        THEN COALESCE(expected_amount, 0)
+                        ELSE amount_due
+                    END,
                     amount_paid = CASE
-                        WHEN COALESCE(amount_paid, 0) = 0 THEN COALESCE(paid_amount, 0)
-                        ELSE amount_paid END,
+                        WHEN COALESCE(amount_paid, 0) = 0
+                        THEN COALESCE(paid_amount, 0)
+                        ELSE amount_paid
+                    END,
                     payment_date = COALESCE(payment_date, paid_date)
             """)
+            cur.execute("RELEASE SAVEPOINT legacy_upgrade")
         except Exception:
-            con.rollback()
-            cur = con.cursor()
+            # Une ancienne structure peut ne pas posséder ces colonnes.
+            cur.execute("ROLLBACK TO SAVEPOINT legacy_upgrade")
+            cur.execute("RELEASE SAVEPOINT legacy_upgrade")
 
         cur.close()
 
 
+def database_status():
+    if use_supabase():
+        return "Supabase PostgreSQL"
+    return "SQLite local (secours)"
 
 def database_status():
     if use_supabase():
@@ -1015,15 +1118,16 @@ def auto_migrate_sqlite_to_supabase():
         s.close()
 
 
+@st.cache_resource(show_spinner=False)
 def init_db():
+    """
+    Initialise la base une seule fois par processus Streamlit.
+    Cela évite de refaire les CREATE TABLE / ALTER TABLE / migrations
+    à chaque interaction de l'utilisateur.
+    """
     if use_supabase():
-        try:
-            create_supabase_schema()
-            auto_migrate_sqlite_to_supabase()
-        except Exception as exc:
-            st.error("Erreur de connexion ou de préparation Supabase.")
-            st.code(str(exc))
-            st.stop()
+        create_supabase_schema()
+        auto_migrate_sqlite_to_supabase()
         return
 
     with db() as con:
@@ -1094,8 +1198,6 @@ def init_db():
             """,
             (ADMIN_USERNAME, ADMIN_PASSWORD, ADMIN_NAME),
         )
-
-
 
 def safe_int_id(value):
     """Convertit un identifiant PostgreSQL/Pandas en entier sans faire planter l'application.
@@ -1261,34 +1363,86 @@ def get_member_login_status():
     )
 
 
-def member_account_data(member_id):
-    """Retourne uniquement les données du membre authentifié."""
-    member_df = get_members(False)
-    member_df = member_df[member_df["id"] == int(member_id)].copy()
-    cdf = contributions(int(member_id)).copy()
-    ldf = loans(int(member_id)).copy()
+@st.cache_data(ttl=15, show_spinner=False)
+def member_account_data_cached(member_id):
+    """Lecture regroupée et temporairement mise en cache pour un membre."""
+    member_id = int(member_id)
 
-    installments = []
-    for _, loan in ldf.iterrows():
-        loan_id = safe_int_id(loan.get("id"))
-        if loan_id is None:
-            continue
-        inst = get_installments(loan_id).copy()
-        if not inst.empty:
-            inst["loan_id"] = loan_id
-            installments.append(inst)
-    idf = pd.concat(installments, ignore_index=True) if installments else pd.DataFrame(
-        columns=["id", "loan_id", "due_date", "amount_due", "amount_paid", "payment_date", "note"]
-    )
+    with db() as con:
+        member_df = pd.read_sql_query(
+            """
+            SELECT id, full_name, phone, monthly_target, notes,
+                   active, member_username, member_login_active, created_at
+            FROM members
+            WHERE id=?
+            LIMIT 1
+            """,
+            con,
+            params=[member_id],
+        )
+
+        cdf = pd.read_sql_query(
+            """
+            SELECT c.id, c.member_id, m.full_name, c.payment_date,
+                   c.month_label, c.amount, c.note
+            FROM contributions c
+            JOIN members m ON m.id = c.member_id
+            WHERE c.member_id=?
+            ORDER BY c.payment_date DESC, c.id DESC
+            """,
+            con,
+            params=[member_id],
+        )
+
+        ldf = pd.read_sql_query(
+            """
+            SELECT l.id, l.member_id, m.full_name, l.loan_date,
+                   l.principal, l.interest_rate, l.total_due,
+                   l.duration_months, l.first_due_date, l.status, l.note
+            FROM loans l
+            JOIN members m ON m.id=l.member_id
+            WHERE l.member_id=?
+            ORDER BY l.loan_date DESC, l.id DESC
+            """,
+            con,
+            params=[member_id],
+        )
+
+        idf = pd.read_sql_query(
+            """
+            SELECT i.id, i.loan_id, i.installment_number, i.due_date,
+                   i.amount_due, i.amount_paid, i.payment_date, i.note
+            FROM loan_installments i
+            JOIN loans l ON l.id=i.loan_id
+            WHERE l.member_id=?
+            ORDER BY i.due_date, i.id
+            """,
+            con,
+            params=[member_id],
+        )
+
     if not idf.empty:
-        for col in ["amount_due", "amount_paid"]:
-            idf[col] = pd.to_numeric(idf[col], errors="coerce").fillna(0)
+        idf["amount_due"] = pd.to_numeric(idf["amount_due"], errors="coerce").fillna(0)
+        idf["amount_paid"] = pd.to_numeric(idf["amount_paid"], errors="coerce").fillna(0)
         idf["reste"] = (idf["amount_due"] - idf["amount_paid"]).clip(lower=0)
 
-    total_contributed = float(pd.to_numeric(cdf.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-    total_borrowed = float(pd.to_numeric(ldf.get("principal", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-    total_received = float(pd.to_numeric(idf.get("amount_paid", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-    total_due = float(pd.to_numeric(idf.get("amount_due", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    total_contributed = float(
+        pd.to_numeric(cdf.get("amount", pd.Series(dtype=float)), errors="coerce")
+        .fillna(0).sum()
+    )
+    total_borrowed = float(
+        pd.to_numeric(ldf.get("principal", pd.Series(dtype=float)), errors="coerce")
+        .fillna(0).sum()
+    )
+    total_received = float(
+        pd.to_numeric(idf.get("amount_paid", pd.Series(dtype=float)), errors="coerce")
+        .fillna(0).sum()
+    )
+    total_due = float(
+        pd.to_numeric(idf.get("amount_due", pd.Series(dtype=float)), errors="coerce")
+        .fillna(0).sum()
+    )
+
     return {
         "member": member_df,
         "contributions": cdf,
@@ -1300,6 +1454,10 @@ def member_account_data(member_id):
         "outstanding": max(total_due - total_received, 0),
     }
 
+
+def member_account_data(member_id):
+    """Retourne uniquement les données du membre authentifié."""
+    return member_account_data_cached(int(member_id))
 
 def member_account_page(member_id):
     data = member_account_data(member_id)
@@ -1382,6 +1540,7 @@ def add_member(name, phone, target, notes):
             )
         )
         con.commit()
+        member_account_data_cached.clear()
 
 
 def update_member(
@@ -1415,6 +1574,7 @@ def update_member(
             )
         )
         con.commit()
+        member_account_data_cached.clear()
 
 
 # ============================================================
@@ -1449,6 +1609,7 @@ def add_contribution(
             )
         )
         con.commit()
+        member_account_data_cached.clear()
 
 
 def update_contribution(
@@ -1478,6 +1639,7 @@ def update_contribution(
             )
         )
         con.commit()
+        member_account_data_cached.clear()
 
 
 def delete_contribution(contribution_id):
