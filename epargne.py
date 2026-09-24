@@ -12,6 +12,11 @@ import pandas as pd
 import streamlit as st
 
 try:
+    import openpyxl  # nécessaire pour les exports Excel
+except ImportError:
+    openpyxl = None
+
+try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
 except ImportError:
@@ -613,6 +618,9 @@ def migrate_database(con):
             "monthly_target": "REAL DEFAULT 0",
             "notes": "TEXT",
             "active": "INTEGER DEFAULT 1",
+            "member_username": "TEXT",
+            "member_password": "TEXT",
+            "member_login_active": "INTEGER DEFAULT 0",
             "created_at": "TEXT",
         },
         "contributions": {
@@ -700,6 +708,9 @@ def create_supabase_schema():
             monthly_target NUMERIC(14,2) NOT NULL DEFAULT 0,
             notes TEXT,
             active BOOLEAN NOT NULL DEFAULT TRUE,
+            member_username TEXT UNIQUE,
+            member_password TEXT,
+            member_login_active BOOLEAN NOT NULL DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """,
@@ -743,6 +754,11 @@ def create_supabase_schema():
         )
         """,
         """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_members_member_username_unique
+        ON public.members(member_username)
+        WHERE member_username IS NOT NULL
+        """,
+        """
         CREATE INDEX IF NOT EXISTS idx_contributions_member_date
         ON public.contributions(member_id, payment_date DESC)
         """,
@@ -778,6 +794,9 @@ def create_supabase_schema():
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS monthly_target NUMERIC(14,2) DEFAULT 0",
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS notes TEXT",
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE",
+            "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS member_username TEXT",
+            "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS member_password TEXT",
+            "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS member_login_active BOOLEAN DEFAULT FALSE",
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
 
             "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS payment_date DATE",
@@ -1026,6 +1045,9 @@ def init_db():
                 monthly_target REAL NOT NULL DEFAULT 0,
                 notes TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
+                member_username TEXT UNIQUE,
+                member_password TEXT,
+                member_login_active INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -1073,6 +1095,33 @@ def init_db():
             (ADMIN_USERNAME, ADMIN_PASSWORD, ADMIN_NAME),
         )
 
+
+
+def safe_int_id(value):
+    """Convertit un identifiant PostgreSQL/Pandas en entier sans faire planter l'application.
+
+    Certaines lignes peuvent arriver sous forme de None, NaN, pd.NA ou texte
+    après une lecture PostgreSQL/Pandas. Dans ce cas, on retourne None et la
+    ligne concernée peut être ignorée dans les listes de sélection.
+    """
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return None
+        number = float(value)
+        if not number.is_integer():
+            return None
+        return int(number)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def money(value):
@@ -1155,6 +1204,126 @@ def authenticate(username, password):
     return dict(row) if row else None
 
 
+# Authentification d'un membre : le compte est strictement lié à un seul membre.
+def authenticate_member(username, password):
+    with db() as con:
+        row = con.execute(
+            """
+            SELECT id, full_name, member_username
+            FROM members
+            WHERE member_username=?
+              AND member_password=?
+              AND member_login_active=TRUE
+              AND active=TRUE
+            LIMIT 1
+            """,
+            (username.strip(), password),
+        ).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["role"] = "member"
+    result["member_id"] = result["id"]
+    return result
+
+
+def set_member_login(member_id, username, password, active=True):
+    username = username.strip()
+    password = password.strip()
+    if not username or not password:
+        raise ValueError("Le nom d'utilisateur et le mot de passe du membre sont obligatoires.")
+    with db() as con:
+        # Empêche qu'un même identifiant soit attribué à deux membres.
+        row = con.execute(
+            "SELECT id FROM members WHERE member_username=? AND id<>? LIMIT 1",
+            (username, member_id),
+        ).fetchone()
+        if row:
+            raise ValueError("Cet identifiant est déjà utilisé par un autre membre.")
+        con.execute(
+            """
+            UPDATE members
+            SET member_username=?, member_password=?, member_login_active=?
+            WHERE id=?
+            """,
+            (username, password, bool(active), member_id),
+        )
+        con.commit()
+
+
+def get_member_login_status():
+    return read_sql(
+        """
+        SELECT id, full_name, phone, member_username, member_login_active
+        FROM members
+        ORDER BY full_name
+        """
+    )
+
+
+def member_account_data(member_id):
+    """Retourne uniquement les données du membre authentifié."""
+    member_df = get_members(False)
+    member_df = member_df[member_df["id"] == int(member_id)].copy()
+    cdf = contributions(int(member_id)).copy()
+    ldf = loans(int(member_id)).copy()
+
+    installments = []
+    for _, loan in ldf.iterrows():
+        loan_id = safe_int_id(loan.get("id"))
+        if loan_id is None:
+            continue
+        inst = get_installments(loan_id).copy()
+        if not inst.empty:
+            inst["loan_id"] = loan_id
+            installments.append(inst)
+    idf = pd.concat(installments, ignore_index=True) if installments else pd.DataFrame(
+        columns=["id", "loan_id", "due_date", "amount_due", "amount_paid", "payment_date", "note"]
+    )
+    if not idf.empty:
+        for col in ["amount_due", "amount_paid"]:
+            idf[col] = pd.to_numeric(idf[col], errors="coerce").fillna(0)
+        idf["reste"] = (idf["amount_due"] - idf["amount_paid"]).clip(lower=0)
+
+    total_contributed = float(pd.to_numeric(cdf.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    total_borrowed = float(pd.to_numeric(ldf.get("principal", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    total_received = float(pd.to_numeric(idf.get("amount_paid", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    total_due = float(pd.to_numeric(idf.get("amount_due", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    return {
+        "member": member_df,
+        "contributions": cdf,
+        "loans": ldf,
+        "installments": idf,
+        "total_contributed": total_contributed,
+        "total_borrowed": total_borrowed,
+        "total_received": total_received,
+        "outstanding": max(total_due - total_received, 0),
+    }
+
+
+def member_account_page(member_id):
+    data = member_account_data(member_id)
+    if data["member"].empty:
+        st.error("Compte membre introuvable.")
+        return
+    name = str(data["member"].iloc[0]["full_name"])
+    brand_hero("Mon compte", f"Bienvenue {name}. Cette page est personnelle et en lecture seule.", compact=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total cotisé", money(data["total_contributed"]))
+    c2.metric("Total emprunté", money(data["total_borrowed"]))
+    c3.metric("Remboursements reçus", money(data["total_received"]))
+    c4.metric("Reste à payer", money(data["outstanding"]))
+
+    st.info("🔒 Vous ne pouvez consulter que vos propres cotisations, emprunts et échéances. Aucune modification n'est autorisée depuis cet espace.")
+    t1, t2, t3 = st.tabs(["💰 Mes cotisations", "💳 Mes emprunts", "📅 Mes échéances"])
+    with t1:
+        st.dataframe(data["contributions"], use_container_width=True, hide_index=True)
+    with t2:
+        st.dataframe(data["loans"], use_container_width=True, hide_index=True)
+    with t3:
+        st.dataframe(data["installments"], use_container_width=True, hide_index=True)
+
+
 # ============================================================
 # MEMBRES
 # ============================================================
@@ -1169,6 +1338,8 @@ def get_members(active_only=False):
             monthly_target,
             notes,
             active,
+            member_username,
+            member_login_active,
             created_at
         FROM members
     """
@@ -1791,7 +1962,9 @@ def dashboard():
 
     for _, member in mdf.iterrows():
 
-        member_id = int(member["id"])
+        member_id = safe_int_id(member.get("id"))
+        if member_id is None:
+            continue
 
         saved = cdf[
             cdf["member_id"] == member_id
@@ -2064,13 +2237,17 @@ def global_report_data():
     # Échéances et remboursements enregistrés.
     installments_frames = []
     for _, loan in ldf.iterrows():
+        loan_id = safe_int_id(loan.get("id"))
+        member_id = safe_int_id(loan.get("member_id"))
+        if loan_id is None or member_id is None:
+            continue
         try:
-            inst = get_installments(int(loan["id"])).copy()
+            inst = get_installments(loan_id).copy()
         except Exception:
             inst = pd.DataFrame()
         if not inst.empty:
-            inst["loan_id"] = int(loan["id"])
-            inst["member_id"] = int(loan["member_id"])
+            inst["loan_id"] = loan_id
+            inst["member_id"] = member_id
             inst["full_name"] = loan["full_name"]
             installments_frames.append(inst)
 
@@ -2103,7 +2280,9 @@ def global_report_data():
 
     rows = []
     for _, member in mdf.iterrows():
-        mid = int(member["id"])
+        mid = safe_int_id(member.get("id"))
+        if mid is None:
+            continue
         mc = cdf[cdf["member_id"] == mid] if not cdf.empty else cdf
         ml = ldf[ldf["member_id"] == mid] if not ldf.empty else ldf
         mi = idf[idf["member_id"] == mid] if not idf.empty else idf
@@ -2144,6 +2323,10 @@ def global_report_data():
 
 def generate_global_excel():
     """Génère un classeur Excel complet : synthèse, membres, cotisations, prêts et échéances."""
+    if openpyxl is None:
+        raise RuntimeError(
+            "Le module openpyxl est requis pour l'export Excel. Ajoutez openpyxl dans requirements.txt puis redéployez l'application."
+        )
     data = global_report_data()
     buffer = BytesIO()
 
@@ -2418,26 +2601,44 @@ if st.session_state.user is None:
             '<div class="login-subtitle">Gérez simplement les membres, les cotisations, les prêts et les rappels de votre groupe étudiant.</div>',
             unsafe_allow_html=True,
         )
-        st.markdown('<div class="section-title">🔐 Se connecter</div>', unsafe_allow_html=True)
+        login_tab_admin, login_tab_member = st.tabs(["👨‍💼 Administrateur", "👤 Membre"])
 
-        with st.form("login_form", clear_on_submit=False):
-            username = st.text_input("Nom d'utilisateur", placeholder="Votre nom d'utilisateur")
-            password = st.text_input("Mot de passe", type="password", placeholder="Votre mot de passe")
-            submitted = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
+        with login_tab_admin:
+            with st.form("login_form_admin", clear_on_submit=False):
+                username = st.text_input("Nom d'utilisateur", placeholder="Identifiant administrateur", key="admin_login_username")
+                password = st.text_input("Mot de passe", type="password", placeholder="Mot de passe", key="admin_login_password")
+                submitted = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
+                if submitted:
+                    try:
+                        user = authenticate(username, password)
+                    except Exception as exc:
+                        st.error("Connexion impossible. Vérifiez la configuration Supabase et les tables.")
+                        st.code(str(exc))
+                        user = None
+                    if user:
+                        user["role"] = "admin"
+                        st.session_state.user = user
+                        st.rerun()
+                    else:
+                        st.error("Identifiants administrateur incorrects.")
 
-            if submitted:
-                try:
-                    user = authenticate(username, password)
-                except Exception as exc:
-                    st.error("Connexion impossible. Vérifiez la configuration Supabase et les tables.")
-                    st.code(str(exc))
-                    user = None
-
-                if user:
-                    st.session_state.user = user
-                    st.rerun()
-                elif username or password:
-                    st.error("Identifiants incorrects.")
+        with login_tab_member:
+            with st.form("login_form_member", clear_on_submit=False):
+                member_username = st.text_input("Identifiant membre", placeholder="Identifiant qui vous a été remis", key="member_login_username")
+                member_password = st.text_input("Mot de passe membre", type="password", placeholder="Votre mot de passe", key="member_login_password")
+                member_submitted = st.form_submit_button("Accéder à mon compte", type="primary", use_container_width=True)
+                if member_submitted:
+                    try:
+                        user = authenticate_member(member_username, member_password)
+                    except Exception as exc:
+                        st.error("Connexion membre impossible. Vérifiez la configuration de la base.")
+                        st.code(str(exc))
+                        user = None
+                    if user:
+                        st.session_state.user = user
+                        st.rerun()
+                    else:
+                        st.error("Identifiant ou mot de passe membre incorrect, ou compte désactivé.")
 
         st.markdown(
             '<div class="info-card">🔒 Vos données d’épargne, de cotisations et de prêts sont enregistrées dans la base configurée par l’administrateur.</div>',
@@ -2451,6 +2652,8 @@ if st.session_state.user is None:
 # ============================================================
 # SIDEBAR
 # ============================================================
+
+user_role = st.session_state.user.get("role", "admin")
 
 st.sidebar.markdown(
     """
@@ -2467,34 +2670,38 @@ st.sidebar.success(
 )
 
 if st.sidebar.button("Se déconnecter"):
-
     st.session_state.user = None
-
     st.rerun()
-
 
 st.sidebar.divider()
 
-page = st.sidebar.radio(
-    "Menu",
-    [
-        "Tableau de bord",
-        "Membres",
-        "Cotisations",
-        "Emprunts",
-        "Rappels WhatsApp",
-        "Rapport global",
-        "Bulletins PDF",
-        "Administrateurs",
-    ]
-)
+if user_role == "member":
+    page = "Mon compte"
+    st.sidebar.info("👤 Espace membre — lecture seule")
+else:
+    page = st.sidebar.radio(
+        "Menu",
+        [
+            "Tableau de bord",
+            "Membres",
+            "Cotisations",
+            "Emprunts",
+            "Rappels WhatsApp",
+            "Rapport global",
+            "Bulletins PDF",
+            "Administrateurs",
+        ]
+    )
 
 
 # ============================================================
 # TABLEAU DE BORD
 # ============================================================
 
-if page == "Tableau de bord":
+if page == "Mon compte" and user_role == "member":
+    member_account_page(int(st.session_state.user["member_id"]))
+
+elif page == "Tableau de bord":
 
     dashboard()
 
@@ -2573,9 +2780,9 @@ elif page == "Membres":
         st.subheader("Modifier un membre")
 
         options = {
-            f"{r['full_name']} — {r['phone']}":
-            int(r["id"])
+            f"{r['full_name']} — {r['phone']}": rid
             for _, r in df.iterrows()
+            if (rid := safe_int_id(r.get("id"))) is not None
         }
 
         selected = st.selectbox(
@@ -2659,9 +2866,9 @@ elif page == "Cotisations":
     else:
 
         member_options = {
-            f"{r['full_name']} — {r['phone']}":
-            int(r["id"])
+            f"{r['full_name']} — {r['phone']}": rid
             for _, r in mdf.iterrows()
+            if (rid := safe_int_id(r.get("id"))) is not None
         }
 
         with st.form("contribution_form"):
@@ -2737,9 +2944,9 @@ elif page == "Emprunts":
     else:
 
         options = {
-            f"{r['full_name']} — {r['phone']}":
-            int(r["id"])
+            f"{r['full_name']} — {r['phone']}": rid
             for _, r in mdf.iterrows()
+            if (rid := safe_int_id(r.get("id"))) is not None
         }
 
         with st.form("loan_form"):
@@ -2823,9 +3030,9 @@ elif page == "Emprunts":
             )
 
             loan_options = {
-                f"#{int(r['id'])} — {r['full_name']} — {money(r['principal'])}":
-                int(r["id"])
+                f"#{rid} — {r['full_name']} — {money(r['principal'])}": rid
                 for _, r in ldf.iterrows()
+                if (rid := safe_int_id(r.get("id"))) is not None
             }
 
             loan_label = st.selectbox(
@@ -2846,9 +3053,9 @@ elif page == "Emprunts":
             if not idf.empty:
 
                 installment_options = {
-                    f"#{int(r['id'])} — {r['due_date']} — dû {money(r['amount_due'])}":
-                    int(r["id"])
+                    f"#{rid} — {r['due_date']} — dû {money(r['amount_due'])}": rid
                     for _, r in idf.iterrows()
+                    if (rid := safe_int_id(r.get("id"))) is not None
                 }
 
                 selected_installment = st.selectbox(
@@ -3084,9 +3291,9 @@ elif page == "Bulletins PDF":
     else:
 
         options = {
-            f"{r['full_name']} — {r['phone']}":
-            int(r["id"])
+            f"{r['full_name']} — {r['phone']}": rid
             for _, r in df.iterrows()
+            if (rid := safe_int_id(r.get("id"))) is not None
         }
 
         selected = st.selectbox(
@@ -3114,57 +3321,59 @@ elif page == "Bulletins PDF":
 
 elif page == "Administrateurs":
 
-    brand_hero("Administrateurs", "Gérez les accès à l’espace de suivi.", compact=True)
+    brand_hero("Administrateurs", "Gérez les administrateurs et les comptes personnels des membres.", compact=True)
 
-    st.subheader(
-        "Ajouter un administrateur"
-    )
+    tab_admins, tab_members_accounts = st.tabs(["👨‍💼 Administrateurs", "👤 Comptes membres"])
 
-    with st.form("admin_form"):
+    with tab_admins:
+        st.subheader("Ajouter un administrateur")
+        with st.form("admin_form"):
+            full_name = st.text_input("Nom complet")
+            username = st.text_input("Nom d'utilisateur")
+            password = st.text_input("Mot de passe", type="password")
+            submit = st.form_submit_button("Ajouter")
+            if submit:
+                try:
+                    add_admin(username, password, full_name)
+                    st.success("Administrateur ajouté.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Impossible d'ajouter l'administrateur : {exc}")
+        st.divider()
+        st.dataframe(get_admins(), use_container_width=True, hide_index=True)
 
-        full_name = st.text_input(
-            "Nom complet"
-        )
+    with tab_members_accounts:
+        st.subheader("Authentification des membres")
+        st.info("Chaque compte est lié à un seul membre. Un membre connecté ne peut voir ni modifier les données des autres membres.")
+        members_df = get_members(False)
+        if members_df.empty:
+            st.warning("Ajoutez d'abord un membre dans le menu Membres.")
+        else:
+            member_options = {
+                f"{r['full_name']} — #{rid}": rid
+                for _, r in members_df.iterrows()
+                if (rid := safe_int_id(r.get("id"))) is not None
+            }
+            selected_label = st.selectbox("Membre à authentifier", list(member_options.keys()))
+            selected_member_id = member_options[selected_label]
+            current = members_df[members_df["id"] == selected_member_id].iloc[0]
+            with st.form("member_account_form"):
+                member_login = st.text_input("Identifiant membre", value=str(current.get("member_username") or ""), placeholder="ex. issa.membre")
+                member_pass = st.text_input("Mot de passe membre", type="password", placeholder="Nouveau mot de passe")
+                member_active = st.checkbox("Autoriser la connexion", value=bool(current.get("member_login_active") or False))
+                save_member_login = st.form_submit_button("💾 Enregistrer le compte membre", type="primary")
+                if save_member_login:
+                    try:
+                        set_member_login(selected_member_id, member_login, member_pass, member_active)
+                        st.success("Compte membre enregistré. Le membre peut maintenant se connecter depuis l'onglet Membre de la page d'accueil.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
 
-        username = st.text_input(
-            "Nom d'utilisateur"
-        )
-
-        password = st.text_input(
-            "Mot de passe",
-            type="password"
-        )
-
-        submit = st.form_submit_button(
-            "Ajouter"
-        )
-
-        if submit:
-
-            try:
-
-                add_admin(
-                    username,
-                    password,
-                    full_name
-                )
-
-                st.success(
-                    "Administrateur ajouté."
-                )
-
-                st.rerun()
-
-            except sqlite3.IntegrityError:
-
-                st.error(
-                    "Ce nom d'utilisateur existe déjà."
-                )
-
-    st.divider()
-
-    st.dataframe(
-        get_admins(),
-        use_container_width=True,
-        hide_index=True
-    )
+            st.markdown("### État des comptes membres")
+            status_df = get_member_login_status().copy()
+            status_df["État"] = status_df["member_login_active"].map(lambda x: "Actif" if bool(x) else "Désactivé")
+            status_df = status_df.rename(columns={"full_name": "Membre", "member_username": "Identifiant"})
+            status_df = status_df[["id", "Membre", "phone", "Identifiant", "État"]]
+            status_df = status_df.rename(columns={"id": "ID", "phone": "Téléphone"})
+            st.dataframe(status_df, use_container_width=True, hide_index=True)
