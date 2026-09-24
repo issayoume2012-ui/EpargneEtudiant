@@ -27,7 +27,7 @@ except ImportError:
 
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
@@ -1379,6 +1379,8 @@ def member_account_data_cached(member_id):
             params=[member_id],
         )
 
+    cdf = _clean_contributions_df(cdf)
+
     if not idf.empty:
         idf["amount_due"] = pd.to_numeric(idf["amount_due"], errors="coerce").fillna(0)
         idf["amount_paid"] = pd.to_numeric(idf["amount_paid"], errors="coerce").fillna(0)
@@ -1693,6 +1695,7 @@ def add_contribution(
         )
         con.commit()
         member_account_data_cached.clear()
+        refresh_application_data()
 
 
 def update_contribution(
@@ -1735,8 +1738,71 @@ def delete_contribution(contribution_id):
         con.commit()
 
 
-def contributions(member_id=None):
+def _clean_contributions_df(df):
+    """Nettoie les éventuelles lignes d'en-tête importées par erreur."""
+    columns = [
+        "id", "member_id", "full_name", "payment_date",
+        "month_label", "amount", "note"
+    ]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=columns)
 
+    df = df.copy()
+    for col in columns:
+        if col not in df.columns:
+            df[col] = None
+
+    def norm(value):
+        if value is None:
+            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except Exception:
+            pass
+        return str(value).strip().lower()
+
+    # Cette ligne apparaît lorsque les noms de colonnes ont été enregistrés
+    # accidentellement comme une vraie cotisation. Elle ne doit jamais être
+    # affichée comme une cotisation réelle.
+    bad_header = (
+        df["id"].map(norm).eq("id")
+        & df["member_id"].map(norm).eq("member_id")
+        & df["full_name"].map(norm).eq("full_name")
+        & df["payment_date"].map(norm).eq("payment_date")
+        & df["month_label"].map(norm).eq("month_label")
+        & df["amount"].map(norm).eq("amount")
+        & df["note"].map(norm).eq("note")
+    )
+    df = df.loc[~bad_header].copy()
+
+    # Une cotisation doit obligatoirement être rattachée à un membre réel.
+    valid_member_ids = set()
+    try:
+        members_df = get_members(False)
+        valid_member_ids = {
+            mid for mid in (safe_int_id(v) for v in members_df["id"].tolist())
+            if mid is not None
+        }
+    except Exception:
+        valid_member_ids = set()
+
+    if valid_member_ids:
+        parsed_ids = df["member_id"].map(safe_int_id)
+        df = df.loc[parsed_ids.isin(valid_member_ids)].copy()
+        df["member_id"] = parsed_ids.loc[df.index].astype(int)
+
+    df["full_name"] = df["full_name"].fillna("").astype(str).str.strip()
+    df["payment_date"] = df["payment_date"].fillna("").astype(str).str.strip()
+    df["month_label"] = df["month_label"].fillna("").astype(str).str.strip()
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+    df["note"] = df["note"].fillna("").astype(str)
+
+    return df.reset_index(drop=True)
+
+
+def contributions(member_id=None):
+    """Retourne les cotisations avec le nom réel du membre, sans lignes parasites."""
     query = """
         SELECT
             c.id,
@@ -1747,28 +1813,17 @@ def contributions(member_id=None):
             c.amount,
             c.note
         FROM contributions c
-        JOIN members m
-            ON m.id = c.member_id
+        JOIN members m ON m.id = c.member_id
     """
 
     params = []
-
     if member_id is not None:
         query += " WHERE c.member_id=? "
         params.append(member_id)
 
-    query += """
-        ORDER BY
-            c.payment_date DESC,
-            c.id DESC
-    """
+    query += " ORDER BY c.payment_date DESC, c.id DESC "
 
-    with db() as con:
-        return pd.read_sql_query(
-            query,
-            con,
-            params=params
-        )
+    return _clean_contributions_df(read_sql(query, params))
 
 
 # ============================================================
@@ -3228,8 +3283,25 @@ elif page == "Cotisations":
 
         cdf = contributions()
 
+        # Tableau lisible : le membre et son montant sont visibles directement.
+        display_cdf = cdf.copy()
+        if not display_cdf.empty:
+            display_cdf = display_cdf.rename(columns={
+                "full_name": "Membre",
+                "payment_date": "Date",
+                "month_label": "Mois",
+                "amount": "Montant",
+                "note": "Note",
+            })
+            display_cdf = display_cdf[["Membre", "Date", "Mois", "Montant", "Note"]]
+            display_cdf["Montant"] = pd.to_numeric(
+                display_cdf["Montant"], errors="coerce"
+            ).fillna(0).map(money)
+        else:
+            display_cdf = pd.DataFrame(columns=["Membre", "Date", "Mois", "Montant", "Note"])
+
         st.dataframe(
-            cdf,
+            display_cdf,
             use_container_width=True,
             hide_index=True
         )
