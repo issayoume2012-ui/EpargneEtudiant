@@ -1,5 +1,7 @@
 import os
 import sqlite3
+import base64
+import mimetypes
 from datetime import date, timedelta
 from contextlib import contextmanager
 from io import BytesIO
@@ -16,10 +18,11 @@ except ImportError:
     psycopg2 = None
     RealDictCursor = None
 
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
 
 try:
@@ -77,7 +80,14 @@ st.set_page_config(
     page_title="Épargne Étudiant",
     page_icon="💰",
     layout="wide",
+    menu_items={"Get help": None, "Report a bug": None, "About": None},
 )
+
+# Réduit la barre d'outils Streamlit lorsque cette option est disponible.
+try:
+    st.set_option("client.toolbarMode", "minimal")
+except Exception:
+    pass
 
 
 # ============================================================
@@ -100,12 +110,20 @@ def inject_brand_css():
 
         .stApp {{
             background:
-                radial-gradient(circle at 95% 0%, rgba(169,212,245,.25), transparent 28%),
+                radial-gradient(circle at 95% 0%, rgba(169,212,245,.22), transparent 28%),
                 linear-gradient(180deg, #ffffff 0%, {BRAND_CREAM} 100%);
         }}
 
         [data-testid="stHeader"] {{
             background: rgba(255,255,255,.82);
+        }}
+
+        /* Masque la barre d'outils Streamlit (Share, GitHub, Edit, etc.) dans l'application. */
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        [data-testid="stStatusWidget"] {{
+            display: none !important;
+            visibility: hidden !important;
         }}
 
         [data-testid="stSidebar"] {{
@@ -123,12 +141,12 @@ def inject_brand_css():
         }}
 
         .brand-hero {{
-            border-radius: 28px;
-            padding: 30px 34px;
-            margin: 4px 0 26px 0;
+            border-radius: 24px;
+            padding: 28px 30px;
+            margin: 4px 0 22px 0;
             background: linear-gradient(135deg, rgba(255,255,255,.97), rgba(238,247,253,.96));
             border: 1px solid rgba(18,42,85,.10);
-            box-shadow: 0 16px 40px rgba(18,42,85,.10);
+            box-shadow: 0 14px 36px rgba(18,42,85,.09);
         }}
 
         .brand-kicker {{
@@ -142,7 +160,7 @@ def inject_brand_css():
 
         .brand-title {{
             color: {BRAND_NAVY};
-            font-size: clamp(2rem, 4vw, 3.3rem);
+            font-size: clamp(2rem, 4vw, 3.2rem);
             line-height: 1.02;
             font-weight: 900;
             margin: 0;
@@ -150,16 +168,47 @@ def inject_brand_css():
 
         .brand-subtitle {{
             color: #40536C;
-            font-size: 1.12rem;
+            font-size: 1.08rem;
+            line-height: 1.5;
             margin-top: 12px;
             margin-bottom: 0;
         }}
 
-        .photo-card {{
-            border-radius: 24px;
+        /* Cadre unique pour toutes les photos : même hauteur, même ratio, même alignement. */
+        .brand-photo-wrap {{
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            border-radius: 22px;
             overflow: hidden;
+            background: linear-gradient(135deg, #eaf5fc, #fff5f7);
+            border: 1px solid rgba(18,42,85,.10);
+            box-shadow: 0 12px 28px rgba(18,42,85,.12);
+        }}
+
+        .brand-photo-wrap img {{
+            width: 100%;
+            height: 100%;
+            display: block;
+            object-fit: cover;
+            object-position: center center;
+        }}
+
+        .photo-card {{
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            border-radius: 22px;
+            overflow: hidden;
+            background: linear-gradient(135deg, #eaf5fc, #fff5f7);
             box-shadow: 0 14px 32px rgba(18,42,85,.14);
             border: 1px solid rgba(18,42,85,.10);
+        }}
+
+        .photo-card img {{
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            object-position: center;
+            display: block;
         }}
 
         .section-title {{
@@ -230,32 +279,36 @@ def inject_brand_css():
 
         /* ---------- Écran de connexion ---------- */
         .login-shell {{
-            max-width: 1120px;
-            margin: 2vh auto 0 auto;
+            max-width: 1160px;
+            margin: 4vh auto 0 auto;
         }}
+
         .login-card {{
             background: rgba(255,255,255,.97);
             border: 1px solid rgba(18,42,85,.10);
-            border-radius: 30px;
-            padding: 34px;
-            box-shadow: 0 24px 65px rgba(18,42,85,.14);
+            border-radius: 28px;
+            padding: 28px;
+            box-shadow: 0 22px 60px rgba(18,42,85,.12);
+            height: 100%;
         }}
+
         .login-photo {{
-            border-radius: 24px;
+            width: 100%;
+            aspect-ratio: 4 / 3;
+            border-radius: 22px;
             overflow: hidden;
             background: linear-gradient(135deg, #eaf5fc, #fff5f7);
             border: 1px solid rgba(18,42,85,.10);
-            min-height: 430px;
-            display:flex;
-            align-items:center;
-            justify-content:center;
         }}
+
         .login-photo img {{
-            width:100%;
-            height:430px;
-            object-fit:cover;
-            display:block;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            object-position: center;
+            display: block;
         }}
+
         .login-badge {{
             display:inline-block;
             padding:7px 12px;
@@ -268,6 +321,7 @@ def inject_brand_css():
             text-transform:uppercase;
             margin-bottom:12px;
         }}
+
         .login-title {{
             color:#122A55;
             font-size:clamp(2.1rem,4vw,3.4rem);
@@ -275,28 +329,85 @@ def inject_brand_css():
             font-weight:950;
             margin-bottom:10px;
         }}
+
         .login-subtitle {{
             color:#53657d;
             font-size:1.05rem;
             line-height:1.55;
             margin-bottom:25px;
         }}
+
         .login-panel {{
-            padding:6px 4px;
+            padding: 30px;
         }}
+
         .login-panel .stButton > button {{
             min-height:48px;
             border-radius:14px;
             font-size:1rem;
         }}
+
+        .global-report-card {{
+            border-radius: 22px;
+            padding: 22px;
+            background: linear-gradient(135deg, rgba(18,42,85,.97), rgba(39,76,121,.94));
+            color: white;
+            box-shadow: 0 16px 36px rgba(18,42,85,.15);
+            margin: 8px 0 20px 0;
+        }}
+
         @media (max-width: 800px) {{
-            .login-card {{ padding:20px; border-radius:22px; }}
-            .login-photo, .login-photo img {{ min-height:250px; height:250px; }}
+            .login-shell {{ margin-top: 2vh; }}
+            .login-card {{ padding:18px; border-radius:22px; }}
+            .login-panel {{ padding:20px; }}
+            .login-photo {{ aspect-ratio: 16 / 10; }}
+            .brand-hero {{ padding:22px; }}
         }}
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+
+def asset_image_html(css_class="brand-photo-wrap", alt="Épargne Étudiant"):
+    """Retourne l'image de marque en HTML pour conserver exactement le même cadrage partout."""
+    if not ASSET_IMAGE.exists():
+        return ""
+    try:
+        mime = mimetypes.guess_type(str(ASSET_IMAGE))[0] or "image/jpeg"
+        data = base64.b64encode(ASSET_IMAGE.read_bytes()).decode("ascii")
+        return f'<div class="{css_class}"><img src="data:{mime};base64,{data}" alt="{alt}"></div>'
+    except Exception:
+        return ""
+
+
+def brand_hero(title="Épargne Étudiant", subtitle="Petits efforts, grands projets !", compact=False):
+    if ASSET_IMAGE.exists():
+        left, right = st.columns([1.35, 0.65] if not compact else [1.6, 0.7], gap="large")
+        with left:
+            st.markdown(
+                f"""
+                <div class="brand-hero">
+                    <div class="brand-kicker">Épargne Étudiant</div>
+                    <div class="brand-title">{title}</div>
+                    <p class="brand-subtitle">{subtitle}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with right:
+            st.markdown(asset_image_html(), unsafe_allow_html=True)
+    else:
+        st.markdown(
+            f"""
+            <div class="brand-hero">
+                <div class="brand-kicker">Épargne Étudiant</div>
+                <div class="brand-title">{title}</div>
+                <p class="brand-subtitle">{subtitle}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 def brand_hero(title="Épargne Étudiant", subtitle="Petits efforts, grands projets !", compact=False):
@@ -361,6 +472,14 @@ class PostgresCursorAdapter:
 
     def close(self):
         return self.cursor.close()
+
+    @property
+    def description(self):
+        return self.cursor.description
+
+    @property
+    def rowcount(self):
+        return self.cursor.rowcount
 
     def __iter__(self):
         return iter(self.cursor)
@@ -504,18 +623,27 @@ def migrate_database(con):
         },
         "loans": {
             "loan_date": "TEXT",
+            "interest_rate": "REAL DEFAULT 0",
+            "total_due": "REAL DEFAULT 0",
+            "duration_months": "INTEGER DEFAULT 1",
+            "first_due_date": "TEXT",
+            "status": "TEXT DEFAULT 'Actif'",
+            "note": "TEXT",
+            "created_at": "TEXT",
             "total_interest_rate": "REAL DEFAULT 0",
             "installments_count": "INTEGER DEFAULT 1",
-            "first_due_date": "TEXT",
-            "note": "TEXT",
-            "created_at": "TEXT",
         },
         "loan_installments": {
+            "installment_number": "INTEGER DEFAULT 1",
             "due_date": "TEXT",
-            "paid_date": "TEXT",
-            "paid_amount": "REAL DEFAULT 0",
+            "amount_due": "REAL DEFAULT 0",
+            "amount_paid": "REAL DEFAULT 0",
+            "payment_date": "TEXT",
             "note": "TEXT",
             "created_at": "TEXT",
+            "expected_amount": "REAL DEFAULT 0",
+            "paid_date": "TEXT",
+            "paid_amount": "REAL DEFAULT 0",
         },
     }
 
@@ -592,9 +720,11 @@ def create_supabase_schema():
             member_id BIGINT NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
             loan_date DATE NOT NULL,
             principal NUMERIC(14,2) NOT NULL,
-            total_interest_rate NUMERIC(8,4) NOT NULL DEFAULT 0,
-            installments_count INTEGER NOT NULL DEFAULT 1,
+            interest_rate NUMERIC(8,4) NOT NULL DEFAULT 0,
+            total_due NUMERIC(14,2) NOT NULL DEFAULT 0,
+            duration_months INTEGER NOT NULL DEFAULT 1,
             first_due_date DATE NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Actif',
             note TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
@@ -603,11 +733,11 @@ def create_supabase_schema():
         CREATE TABLE IF NOT EXISTS public.loan_installments (
             id BIGSERIAL PRIMARY KEY,
             loan_id BIGINT NOT NULL REFERENCES public.loans(id) ON DELETE CASCADE,
-            installment_number INTEGER NOT NULL,
+            installment_number INTEGER NOT NULL DEFAULT 1,
             due_date DATE NOT NULL,
-            expected_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
-            paid_date DATE,
-            paid_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+            amount_due NUMERIC(14,2) NOT NULL DEFAULT 0,
+            amount_paid NUMERIC(14,2) NOT NULL DEFAULT 0,
+            payment_date DATE,
             note TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
@@ -656,19 +786,26 @@ def create_supabase_schema():
             "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
 
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS loan_date DATE",
-            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS total_interest_rate NUMERIC(8,4) DEFAULT 0",
-            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS installments_count INTEGER DEFAULT 1",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS interest_rate NUMERIC(8,4) DEFAULT 0",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS total_due NUMERIC(14,2) DEFAULT 0",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS duration_months INTEGER DEFAULT 1",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS first_due_date DATE",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'Actif'",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS note TEXT",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS total_interest_rate NUMERIC(8,4) DEFAULT 0",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS installments_count INTEGER DEFAULT 1",
 
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS installment_number INTEGER DEFAULT 1",
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS due_date DATE",
+            "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS amount_due NUMERIC(14,2) DEFAULT 0",
+            "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS amount_paid NUMERIC(14,2) DEFAULT 0",
+            "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS payment_date DATE",
+            "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS note TEXT",
+            "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS expected_amount NUMERIC(14,2) DEFAULT 0",
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS paid_date DATE",
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(14,2) DEFAULT 0",
-            "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS note TEXT",
-            "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
         ]
 
         for statement in alter_statements:
@@ -679,6 +816,37 @@ def create_supabase_schema():
                 # Les tables principales ont déjà été créées avec le bon schéma.
                 con.rollback()
                 cur = con.cursor()
+
+        # Reprise des anciennes colonnes si une base Supabase existait déjà.
+        # On ne remplace jamais une valeur moderne déjà renseignée.
+        try:
+            cur.execute("""
+                UPDATE public.loans
+                SET interest_rate = CASE
+                        WHEN COALESCE(interest_rate, 0) = 0 THEN COALESCE(total_interest_rate, 0)
+                        ELSE interest_rate END,
+                    duration_months = CASE
+                        WHEN COALESCE(duration_months, 0) <= 0 THEN COALESCE(installments_count, 1)
+                        ELSE duration_months END,
+                    total_due = CASE
+                        WHEN COALESCE(total_due, 0) = 0
+                        THEN principal * (1 + COALESCE(total_interest_rate, 0) / 100.0)
+                        ELSE total_due END,
+                    status = COALESCE(NULLIF(status, ''), 'Actif')
+            """)
+            cur.execute("""
+                UPDATE public.loan_installments
+                SET amount_due = CASE
+                        WHEN COALESCE(amount_due, 0) = 0 THEN COALESCE(expected_amount, 0)
+                        ELSE amount_due END,
+                    amount_paid = CASE
+                        WHEN COALESCE(amount_paid, 0) = 0 THEN COALESCE(paid_amount, 0)
+                        ELSE amount_paid END,
+                    payment_date = COALESCE(payment_date, paid_date)
+            """)
+        except Exception:
+            con.rollback()
+            cur = con.cursor()
 
         cur.close()
 
@@ -780,15 +948,20 @@ def auto_migrate_sqlite_to_supabase():
                     if found:
                         loan_map[l["id"]]=found["id"]
                     else:
+                        rate = float(l["total_interest_rate"] or 0) if "total_interest_rate" in l.keys() else 0
+                        duration = int(l["installments_count"] or 1) if "installments_count" in l.keys() else 1
+                        principal = float(l["principal"] or 0)
+                        total_due = principal * (1 + rate / 100.0)
                         cur.execute("""
                             INSERT INTO public.loans
-                            (member_id,loan_date,principal,total_interest_rate,
-                             installments_count,first_due_date,note)
-                            VALUES (?,?,?,?,?,?,?) RETURNING id
+                            (member_id,loan_date,principal,interest_rate,total_due,
+                             duration_months,first_due_date,status,note,total_interest_rate,installments_count)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id
                         """,(
-                            mid,l["loan_date"],l["principal"],
-                            l["total_interest_rate"],l["installments_count"],
-                            l["first_due_date"],l["note"] if "note" in l.keys() else None,
+                            mid,l["loan_date"],principal,rate,total_due,
+                            duration,l["first_due_date"],"Actif",
+                            l["note"] if "note" in l.keys() else None,
+                            rate,duration,
                         ))
                         loan_map[l["id"]]=cur.fetchone()["id"]
 
@@ -803,13 +976,14 @@ def auto_migrate_sqlite_to_supabase():
                     if not cur.fetchone():
                         cur.execute("""
                             INSERT INTO public.loan_installments
-                            (loan_id,installment_number,due_date,expected_amount,
-                             paid_date,paid_amount,note)
-                            VALUES (?,?,?,?,?,?,?)
+                            (loan_id,installment_number,due_date,amount_due,
+                             amount_paid,payment_date,note,expected_amount,paid_date,paid_amount)
+                            VALUES (?,?,?,?,?,?,?,?,?,?)
                         """,(
                             lid,i["installment_number"],i["due_date"],
-                            i["expected_amount"],i["paid_date"],i["paid_amount"],
+                            i["expected_amount"],i["paid_amount"],i["paid_date"],
                             i["note"] if "note" in i.keys() else None,
+                            i["expected_amount"],i["paid_date"],i["paid_amount"],
                         ))
 
             cur.execute("""
@@ -1873,6 +2047,333 @@ def generate_member_pdf(member_id):
 
 
 # ============================================================
+# RAPPORT GLOBAL PDF + EXCEL
+# ============================================================
+
+def global_report_data():
+    """Construit une vue globale et détaillée de toute l'épargne enregistrée."""
+    mdf = get_members(False).copy()
+    cdf = contributions().copy()
+    ldf = loans().copy()
+
+    if cdf.empty:
+        cdf = pd.DataFrame(columns=["id", "member_id", "full_name", "payment_date", "month_label", "amount", "note"])
+    if ldf.empty:
+        ldf = pd.DataFrame(columns=["id", "member_id", "full_name", "loan_date", "principal", "interest_rate", "total_due", "duration_months", "first_due_date", "status", "note"])
+
+    # Échéances et remboursements enregistrés.
+    installments_frames = []
+    for _, loan in ldf.iterrows():
+        try:
+            inst = get_installments(int(loan["id"])).copy()
+        except Exception:
+            inst = pd.DataFrame()
+        if not inst.empty:
+            inst["loan_id"] = int(loan["id"])
+            inst["member_id"] = int(loan["member_id"])
+            inst["full_name"] = loan["full_name"]
+            installments_frames.append(inst)
+
+    if installments_frames:
+        idf = pd.concat(installments_frames, ignore_index=True)
+    else:
+        idf = pd.DataFrame(columns=["id", "loan_id", "due_date", "amount_due", "amount_paid", "payment_date", "note", "member_id", "full_name"])
+
+    total_contributed = float(pd.to_numeric(cdf.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    total_borrowed = float(pd.to_numeric(ldf.get("principal", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    total_received = float(pd.to_numeric(idf.get("amount_paid", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    total_due = float(pd.to_numeric(idf.get("amount_due", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    outstanding = max(total_due - total_received, 0.0)
+    available = total_contributed + total_received - total_borrowed
+
+    if not cdf.empty:
+        cdf["amount"] = pd.to_numeric(cdf["amount"], errors="coerce").fillna(0)
+        cdf["payment_date"] = cdf["payment_date"].astype(str)
+    if not ldf.empty:
+        for col in ["principal", "interest_rate", "total_due"]:
+            ldf[col] = pd.to_numeric(ldf[col], errors="coerce").fillna(0)
+        ldf["loan_date"] = ldf["loan_date"].astype(str)
+        ldf["first_due_date"] = ldf["first_due_date"].astype(str)
+    if not idf.empty:
+        for col in ["amount_due", "amount_paid"]:
+            idf[col] = pd.to_numeric(idf[col], errors="coerce").fillna(0)
+        idf["remaining"] = (idf["amount_due"] - idf["amount_paid"]).clip(lower=0)
+        idf["due_date"] = idf["due_date"].astype(str)
+        idf["payment_date"] = idf["payment_date"].fillna("").astype(str)
+
+    rows = []
+    for _, member in mdf.iterrows():
+        mid = int(member["id"])
+        mc = cdf[cdf["member_id"] == mid] if not cdf.empty else cdf
+        ml = ldf[ldf["member_id"] == mid] if not ldf.empty else ldf
+        mi = idf[idf["member_id"] == mid] if not idf.empty else idf
+        contributed = float(mc["amount"].sum()) if not mc.empty else 0
+        borrowed = float(ml["principal"].sum()) if not ml.empty else 0
+        received = float(mi["amount_paid"].sum()) if not mi.empty else 0
+        due = float(mi["amount_due"].sum()) if not mi.empty else 0
+        months = sorted(set(str(x) for x in mc["month_label"].dropna())) if not mc.empty else []
+        rows.append({
+            "Membre": member["full_name"],
+            "Téléphone": member["phone"],
+            "Mois de cotisation": ", ".join(months),
+            "Nombre de mois": len(months),
+            "Total cotisé": contributed,
+            "Total emprunté": borrowed,
+            "Somme reçue": received,
+            "Échéances prévues": due,
+            "Reste à recevoir": max(due - received, 0),
+            "Disponible net": contributed + received - borrowed,
+        })
+
+    summary_df = pd.DataFrame(rows)
+    return {
+        "members": mdf,
+        "contributions": cdf,
+        "loans": ldf,
+        "installments": idf,
+        "summary": summary_df,
+        "total_contributed": total_contributed,
+        "total_borrowed": total_borrowed,
+        "total_received": total_received,
+        "total_due": total_due,
+        "outstanding": outstanding,
+        "available": available,
+        "contribution_months": sorted(set(str(x) for x in cdf["month_label"].dropna())) if not cdf.empty else [],
+    }
+
+
+def generate_global_excel():
+    """Génère un classeur Excel complet : synthèse, membres, cotisations, prêts et échéances."""
+    data = global_report_data()
+    buffer = BytesIO()
+
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        summary = pd.DataFrame([
+            ["Total cotisé", data["total_contributed"]],
+            ["Total emprunté", data["total_borrowed"]],
+            ["Somme reçue sur remboursements", data["total_received"]],
+            ["Total des échéances prévues", data["total_due"]],
+            ["Reste à recevoir", data["outstanding"]],
+            ["Somme disponible nette", data["available"]],
+            ["Nombre de membres", len(data["members"])],
+            ["Nombre de mois de cotisation", len(data["contribution_months"])],
+            ["Mois de cotisation", ", ".join(data["contribution_months"])],
+            ["Généré le", date.today().isoformat()],
+        ], columns=["Indicateur", "Valeur"])
+        summary.to_excel(writer, sheet_name="Synthèse", index=False)
+        data["summary"].to_excel(writer, sheet_name="Par membre", index=False)
+        data["contributions"].to_excel(writer, sheet_name="Cotisations", index=False)
+        data["loans"].to_excel(writer, sheet_name="Emprunts", index=False)
+        data["installments"].to_excel(writer, sheet_name="Échéances", index=False)
+
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for col in ws.columns:
+                max_len = max((len(str(cell.value)) if cell.value is not None else 0) for cell in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max(max_len + 2, 12), 42)
+            for cell in ws[1]:
+                cell.font = cell.font.copy(bold=True)
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _pdf_image(path, max_width, max_height):
+    """Retourne une image PDF sans déformation, avec conservation de son ratio."""
+    try:
+        reader = ImageReader(str(path))
+        width, height = reader.getSize()
+        if not width or not height:
+            return None
+        ratio = min(max_width / width, max_height / height)
+        img = RLImage(str(path), width=width * ratio, height=height * ratio)
+        return img
+    except Exception:
+        return None
+
+
+def generate_global_pdf():
+    """Génère le rapport global PDF de toutes les opérations enregistrées."""
+    data = global_report_data()
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        rightMargin=10 * mm,
+        leftMargin=10 * mm,
+        topMargin=12 * mm,
+        bottomMargin=12 * mm,
+        title="Rapport global - Épargne Étudiant",
+        author=ADMIN_NAME,
+    )
+
+    styles = getSampleStyleSheet()
+    title = styles["Title"].clone("GlobalTitle")
+    title.fontName = "Helvetica-Bold"
+    title.fontSize = 21
+    title.leading = 24
+    title.textColor = colors.HexColor(BRAND_NAVY)
+
+    h2 = styles["Heading2"].clone("GlobalH2")
+    h2.fontName = "Helvetica-Bold"
+    h2.fontSize = 12.5
+    h2.textColor = colors.HexColor(BRAND_NAVY)
+    h2.spaceBefore = 5
+    h2.spaceAfter = 5
+
+    small = styles["Normal"].clone("GlobalSmall")
+    small.fontSize = 8
+    small.leading = 10
+    small.textColor = colors.HexColor("#53657D")
+
+    story = []
+    header_cells = []
+    img = _pdf_image(ASSET_IMAGE, 32 * mm, 25 * mm) if ASSET_IMAGE.exists() else None
+    header_cells.append(img if img else Spacer(32 * mm, 20 * mm))
+    header_cells.append([
+        Paragraph("ÉPARGNE ÉTUDIANT", title),
+        Spacer(1, 1 * mm),
+        Paragraph("Rapport global de l'épargne, des cotisations, des prêts et des échéances", small),
+        Paragraph(f"Édité le {date.today().strftime('%d/%m/%Y')} — Administrateur : {ADMIN_NAME}", small),
+    ])
+    ht = Table([header_cells], colWidths=[40 * mm, 235 * mm])
+    ht.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#F7FBFE")),
+        ("BOX", (0,0), (-1,-1), 0.7, colors.HexColor("#D7E5F0")),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), 7),
+        ("RIGHTPADDING", (0,0), (-1,-1), 7),
+        ("TOPPADDING", (0,0), (-1,-1), 7),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 7),
+    ]))
+    story += [ht, Spacer(1, 5 * mm)]
+
+    metrics = [
+        [Paragraph(f"<b>TOTAL COTISÉ</b><br/><font size=15>{money(data['total_contributed'])}</font>", small),
+         Paragraph(f"<b>TOTAL EMPRUNTÉ</b><br/><font size=15>{money(data['total_borrowed'])}</font>", small),
+         Paragraph(f"<b>SOMME REÇUE</b><br/><font size=15>{money(data['total_received'])}</font>", small),
+         Paragraph(f"<b>ÉCHÉANCES RESTANTES</b><br/><font size=15>{money(data['outstanding'])}</font>", small),
+         Paragraph(f"<b>DISPONIBLE NET</b><br/><font size=15>{money(data['available'])}</font>", small)]
+    ]
+    mt = Table(metrics, colWidths=[54 * mm] * 5)
+    mt.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (0,0), colors.HexColor("#EAF5FB")),
+        ("BACKGROUND", (1,0), (1,0), colors.HexColor("#FFF0F3")),
+        ("BACKGROUND", (2,0), (2,0), colors.HexColor("#EAF6F3")),
+        ("BACKGROUND", (3,0), (3,0), colors.HexColor("#FFF7E8")),
+        ("BACKGROUND", (4,0), (4,0), colors.HexColor("#EDF0FA")),
+        ("BOX", (0,0), (-1,-1), 0.5, colors.HexColor("#D7E5F0")),
+        ("INNERGRID", (0,0), (-1,-1), 0.5, colors.white),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), 7),
+        ("RIGHTPADDING", (0,0), (-1,-1), 7),
+        ("TOPPADDING", (0,0), (-1,-1), 7),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 7),
+    ]))
+    story += [mt, Spacer(1, 4 * mm)]
+
+    story.append(Paragraph("1. Synthèse par membre", h2))
+    summary_data = [["Membre", "Mois", "Cotisé", "Emprunté", "Reçu", "Échéances", "Reste", "Disponible net"]]
+    for _, r in data["summary"].iterrows():
+        summary_data.append([
+            str(r["Membre"]), str(r["Nombre de mois"]), money(r["Total cotisé"]), money(r["Total emprunté"]),
+            money(r["Somme reçue"]), money(r["Échéances prévues"]), money(r["Reste à recevoir"]), money(r["Disponible net"])
+        ])
+    if len(summary_data) == 1:
+        summary_data.append(["Aucun membre", "0", money(0), money(0), money(0), money(0), money(0), money(0)])
+    stbl = Table(summary_data, repeatRows=1, colWidths=[57*mm, 15*mm, 27*mm, 27*mm, 27*mm, 27*mm, 27*mm, 31*mm])
+    stbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor(BRAND_NAVY)),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 7.5),
+        ("GRID", (0,0), (-1,-1), 0.3, colors.HexColor("#D8E0E8")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F7FAFC")]),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 4),
+        ("RIGHTPADDING", (0,0), (-1,-1), 4),
+        ("TOPPADDING", (0,0), (-1,-1), 4),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+    ]))
+    story += [stbl, Spacer(1, 4 * mm)]
+
+    story.append(Paragraph("2. Toutes les cotisations enregistrées", h2))
+    ctable = [["Membre", "Date", "Mois", "Montant", "Note"]]
+    for _, r in data["contributions"].iterrows():
+        ctable.append([str(r.get("full_name", "")), str(r.get("payment_date", "")), str(r.get("month_label", "")), money(r.get("amount", 0)), str(r.get("note", "") or "")])
+    if len(ctable) == 1:
+        ctable.append(["Aucune", "-", "-", money(0), ""])
+    ct = Table(ctable, repeatRows=1, colWidths=[55*mm, 28*mm, 28*mm, 32*mm, 98*mm])
+    ct.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor(BRAND_NAVY)),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 7.5),
+        ("GRID", (0,0), (-1,-1), 0.3, colors.HexColor("#D8E0E8")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F7FAFC")]),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+    ]))
+    story += [ct, Spacer(1, 4 * mm)]
+
+    story.append(Paragraph("3. Tous les emprunts enregistrés", h2))
+    ltable = [["Membre", "Date", "Principal", "Taux", "Total dû", "Durée", "1ère échéance", "Statut"]]
+    for _, r in data["loans"].iterrows():
+        ltable.append([
+            str(r.get("full_name", "")), str(r.get("loan_date", "")), money(r.get("principal", 0)),
+            f"{float(r.get('interest_rate', 0)):.2f} %", money(r.get("total_due", 0)),
+            f"{r.get('duration_months', 0)} mois", str(r.get("first_due_date", "")), str(r.get("status", ""))
+        ])
+    if len(ltable) == 1:
+        ltable.append(["Aucun", "-", money(0), "0 %", money(0), "-", "-", "-"])
+    lt = Table(ltable, repeatRows=1, colWidths=[52*mm, 25*mm, 31*mm, 20*mm, 31*mm, 25*mm, 32*mm, 45*mm])
+    lt.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor(BRAND_GREEN)),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 7.3),
+        ("GRID", (0,0), (-1,-1), 0.3, colors.HexColor("#D8E0E8")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F7FAFC")]),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+    ]))
+    story += [lt, Spacer(1, 4 * mm)]
+
+    story.append(Paragraph("4. Échéances et remboursements", h2))
+    itable = [["Membre", "N° prêt", "Échéance", "Montant prévu", "Montant reçu", "Reste", "Date réception", "Note"]]
+    for _, r in data["installments"].iterrows():
+        itable.append([
+            str(r.get("full_name", "")), str(r.get("loan_id", "")), str(r.get("due_date", "")),
+            money(r.get("amount_due", 0)), money(r.get("amount_paid", 0)), money(r.get("remaining", 0)),
+            str(r.get("payment_date", "")), str(r.get("note", "") or "")
+        ])
+    if len(itable) == 1:
+        itable.append(["Aucune", "-", "-", money(0), money(0), money(0), "-", ""])
+    it = Table(itable, repeatRows=1, colWidths=[48*mm, 22*mm, 28*mm, 32*mm, 32*mm, 27*mm, 30*mm, 60*mm])
+    it.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor(BRAND_NAVY)),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 7.2),
+        ("GRID", (0,0), (-1,-1), 0.3, colors.HexColor("#D8E0E8")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F7FAFC")]),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+    ]))
+    story.append(it)
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.HexColor("#687A90"))
+        canvas.drawString(10 * mm, 6 * mm, "Épargne Étudiant — Rapport global")
+        canvas.drawRightString(landscape(A4)[0] - 10 * mm, 6 * mm, f"Page {doc.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ============================================================
 # INTERFACE
 # ============================================================
 
@@ -1898,9 +2399,7 @@ if st.session_state.user is None:
     with left:
         st.markdown('<div class="login-card">', unsafe_allow_html=True)
         if ASSET_IMAGE.exists():
-            st.markdown('<div class="login-photo">', unsafe_allow_html=True)
-            st.image(str(ASSET_IMAGE), use_container_width=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown(asset_image_html("login-photo"), unsafe_allow_html=True)
         else:
             st.markdown(
                 """<div class="login-photo"><div style="text-align:center;padding:30px;">
@@ -1984,6 +2483,7 @@ page = st.sidebar.radio(
         "Cotisations",
         "Emprunts",
         "Rappels WhatsApp",
+        "Rapport global",
         "Bulletins PDF",
         "Administrateurs",
     ]
@@ -2495,6 +2995,74 @@ elif page == "Rappels WhatsApp":
                 message
             )
         )
+
+
+# ============================================================
+# RAPPORT GLOBAL
+# ============================================================
+
+elif page == "Rapport global":
+
+    brand_hero(
+        "Rapport global",
+        "Une vue complète de toutes les cotisations, tous les emprunts, les remboursements et les échéances.",
+        compact=True,
+    )
+
+    data = global_report_data()
+
+    st.markdown(
+        """<div class="global-report-card">
+        <div style="font-size:1.25rem;font-weight:900;">📊 Situation globale</div>
+        <div style="margin-top:8px;opacity:.92;line-height:1.55;">
+        Le disponible net est calculé selon les opérations enregistrées : <b>cotisations + remboursements reçus − montants empruntés</b>.
+        Les données correspondent uniquement aux opérations présentes dans la base.
+        </div></div>""",
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total cotisé", money(data["total_contributed"]))
+    c2.metric("Total emprunté", money(data["total_borrowed"]))
+    c3.metric("Somme reçue", money(data["total_received"]))
+    c4.metric("Reste à recevoir", money(data["outstanding"]))
+    c5.metric("Disponible net", money(data["available"]))
+
+    st.write(f"**Mois de cotisation enregistrés :** {', '.join(data['contribution_months']) if data['contribution_months'] else 'Aucun'}")
+    st.write(f"**Membres :** {len(data['members'])}  •  **Échéances :** {len(data['installments'])}")
+
+    st.markdown('<div class="section-title">👥 Synthèse par membre</div>', unsafe_allow_html=True)
+    display_summary = data["summary"].copy()
+    if not display_summary.empty:
+        for col in ["Total cotisé", "Total emprunté", "Somme reçue", "Échéances prévues", "Reste à recevoir", "Disponible net"]:
+            display_summary[col] = display_summary[col].map(money)
+    st.dataframe(display_summary, use_container_width=True, hide_index=True)
+
+    b1, b2 = st.columns(2)
+    with b1:
+        st.download_button(
+            "📥 Télécharger le rapport global PDF",
+            data=generate_global_pdf(),
+            file_name=f"rapport_global_epargne_{date.today().isoformat()}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            type="primary",
+        )
+    with b2:
+        st.download_button(
+            "📊 Télécharger le rapport global Excel",
+            data=generate_global_excel(),
+            file_name=f"rapport_global_epargne_{date.today().isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    with st.expander("Voir toutes les cotisations"):
+        st.dataframe(data["contributions"], use_container_width=True, hide_index=True)
+    with st.expander("Voir tous les emprunts"):
+        st.dataframe(data["loans"], use_container_width=True, hide_index=True)
+    with st.expander("Voir toutes les échéances"):
+        st.dataframe(data["installments"], use_container_width=True, hide_index=True)
 
 
 # ============================================================
