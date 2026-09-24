@@ -65,12 +65,28 @@ TWILIO_WHATSAPP_FROM = secret_or_env(
 
 # Configuration Supabase / PostgreSQL.
 # On lit d'abord .streamlit/secrets.toml, puis les variables d'environnement.
+# Supabase/PostgreSQL : accepte les deux formats de secrets :
+#   [postgres] host/port/database/user/password/sslmode
+# ou des clés plates SUPABASE_DB_* / SUPABASE_* .
+def postgres_secret(name, default=""):
+    try:
+        section = st.secrets.get("postgres", {})
+        if hasattr(section, "get"):
+            value = section.get(name, "")
+            if value not in (None, ""):
+                return value
+    except Exception:
+        pass
+    return secret_or_env(name, default)
+
 SUPABASE_DB_URL = secret_or_env("SUPABASE_DB_URL", "")
-SUPABASE_HOST = secret_or_env("SUPABASE_HOST", "")
-SUPABASE_PORT = secret_or_env("SUPABASE_PORT", "5432")
-SUPABASE_DATABASE = secret_or_env("SUPABASE_DATABASE", "postgres")
-SUPABASE_USER = secret_or_env("SUPABASE_USER", "")
-SUPABASE_PASSWORD = secret_or_env("SUPABASE_PASSWORD", "")
+SUPABASE_HOST = postgres_secret("host", "") or secret_or_env("SUPABASE_HOST", "")
+SUPABASE_PORT = str(postgres_secret("port", "5432") or "5432")
+SUPABASE_DATABASE = postgres_secret("database", "postgres") or secret_or_env("SUPABASE_DATABASE", "postgres")
+SUPABASE_USER = postgres_secret("user", "") or secret_or_env("SUPABASE_USER", "")
+SUPABASE_PASSWORD = postgres_secret("password", "") or secret_or_env("SUPABASE_PASSWORD", "")
+SUPABASE_SSLMODE = postgres_secret("sslmode", "require") or "require"
+SUPABASE_CONNECT_TIMEOUT = int(postgres_secret("connect_timeout", "10") or 10)
 
 # Visuel de marque fourni pour l'application et les bulletins PDF.
 ASSET_IMAGE = Path(__file__).with_name("pe.jpeg")
@@ -520,25 +536,53 @@ def postgres_dsn():
         f"dbname={SUPABASE_DATABASE} "
         f"user={SUPABASE_USER} "
         f"password={SUPABASE_PASSWORD} "
-        f"sslmode=require"
+        f"sslmode={SUPABASE_SSLMODE} "
+        f"connect_timeout={SUPABASE_CONNECT_TIMEOUT}"
     )
 
 
 def use_supabase():
-    """Indique si une connexion Supabase/PostgreSQL peut être utilisée."""
+    """Retourne True uniquement si PostgreSQL Supabase est réellement configuré."""
     configured = bool(
         SUPABASE_DB_URL
-        or (
-            SUPABASE_HOST
-            and SUPABASE_USER
-            and SUPABASE_PASSWORD
-        )
+        or (SUPABASE_HOST and SUPABASE_USER and SUPABASE_PASSWORD)
     )
     return configured and psycopg2 is not None
 
 
+def require_supabase():
+    """Empêche silencieusement l'application de basculer vers SQLite."""
+    if not use_supabase():
+        missing = []
+        if not SUPABASE_HOST: missing.append("host")
+        if not SUPABASE_USER: missing.append("user")
+        if not SUPABASE_PASSWORD: missing.append("password")
+        if psycopg2 is None: missing.append("psycopg2-binary")
+        details = ", ".join(missing) if missing else "configuration PostgreSQL"
+        raise RuntimeError(
+            "Supabase PostgreSQL n'est pas disponible. Vérifiez les secrets [postgres] "
+            f"et requirements.txt ({details})."
+        )
+
+
+def supabase_health_check():
+    """Teste réellement la connexion et la présence du schéma Supabase."""
+    require_supabase()
+    with db() as con:
+        row = con.execute(
+            "SELECT current_database() AS db, current_schema() AS schema, NOW() AS server_time"
+        ).fetchone()
+        tables = {}
+        for table in ("members", "contributions", "loans", "loan_installments"):
+            found = con.execute(
+                "SELECT to_regclass(?) AS name", (f"public.{table}",)
+            ).fetchone()
+            tables[table] = bool(found and found.get("name"))
+        return row, tables
+
+
 @st.cache_resource(show_spinner=False)
-def get_pg_pool():
+def get_pg_pool(dsn=None):
     """
     Pool PostgreSQL partagé par l'application.
     Évite d'ouvrir une nouvelle connexion Supabase à chaque requête.
@@ -546,7 +590,7 @@ def get_pg_pool():
     if not use_supabase() or ThreadedConnectionPool is None:
         return None
 
-    dsn = postgres_dsn()
+    dsn = dsn or postgres_dsn()
     return ThreadedConnectionPool(
         minconn=1,
         maxconn=5,
@@ -568,7 +612,7 @@ def db():
     SQLite reste disponible uniquement comme secours local.
     """
     if use_supabase():
-        pool = get_pg_pool()
+        pool = get_pg_pool(postgres_dsn())
         if pool is None:
             raise RuntimeError("Le pool PostgreSQL n'est pas disponible.")
 
@@ -991,9 +1035,16 @@ def auto_migrate_sqlite_to_supabase():
             member_map={}
             if sqlite_table_exists(s,"members"):
                 for m in s.execute("SELECT * FROM members ORDER BY id").fetchall():
+                    legacy_name = str(m["full_name"] or "").strip().lower()
+                    legacy_phone = str(m["phone"] or "").strip().lower() if "phone" in m.keys() else ""
+                    legacy_notes = str(m["notes"] or "").strip().lower() if "notes" in m.keys() else ""
+                    if legacy_name in {"", "full_name", "nom complet", "nom_complet"}:
+                        continue
+                    if legacy_name == "id" or (legacy_phone in {"phone", "telephone", "téléphone"} and legacy_notes in {"notes", "note"}):
+                        continue
                     cur.execute("""
                         SELECT id FROM public.members
-                        WHERE full_name=? AND COALESCE(phone,'')=COALESCE(?,'')
+                        WHERE lower(trim(full_name))=lower(trim(?)) AND COALESCE(phone,'')=COALESCE(?,'')
                         LIMIT 1
                     """,(m["full_name"],m["phone"] if "phone" in m.keys() else None))
                     found=cur.fetchone()
@@ -1095,85 +1146,16 @@ def auto_migrate_sqlite_to_supabase():
 
 
 @st.cache_resource(show_spinner=False)
-def init_db():
-    """
-    Initialise la base une seule fois par processus Streamlit.
-    Cela évite de refaire les CREATE TABLE / ALTER TABLE / migrations
-    à chaque interaction de l'utilisateur.
-    """
-    if use_supabase():
-        create_supabase_schema()
+def init_db(config_fingerprint=None):
+    """Initialise exclusivement Supabase PostgreSQL."""
+    require_supabase()
+    create_supabase_schema()
+    # La migration SQLite n'est lancée que si elle est explicitement activée.
+    # Cela évite qu'une vieille base locale détourne ou ralentisse l'application.
+    migrate_flag = str(secret_or_env("MIGRATE_SQLITE_TO_SUPABASE", "1")).strip().lower()
+    if migrate_flag in {"1", "true", "yes", "oui"}:
         auto_migrate_sqlite_to_supabase()
-        return
-
-    with db() as con:
-        con.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS admins (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                full_name TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS members (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                full_name TEXT NOT NULL,
-                phone TEXT NOT NULL DEFAULT '777521969',
-                monthly_target REAL NOT NULL DEFAULT 0,
-                notes TEXT,
-                active INTEGER NOT NULL DEFAULT 1,
-                member_username TEXT UNIQUE,
-                member_password TEXT,
-                member_login_active INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS contributions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                member_id INTEGER NOT NULL,
-                payment_date TEXT NOT NULL,
-                amount REAL NOT NULL DEFAULT 0,
-                month_label TEXT NOT NULL,
-                note TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS loans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                member_id INTEGER NOT NULL,
-                loan_date TEXT NOT NULL,
-                principal REAL NOT NULL,
-                total_interest_rate REAL NOT NULL DEFAULT 0,
-                installments_count INTEGER NOT NULL DEFAULT 1,
-                first_due_date TEXT NOT NULL,
-                note TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS loan_installments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                loan_id INTEGER NOT NULL,
-                installment_number INTEGER NOT NULL,
-                due_date TEXT NOT NULL,
-                expected_amount REAL NOT NULL DEFAULT 0,
-                paid_date TEXT,
-                paid_amount REAL NOT NULL DEFAULT 0,
-                note TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-        migrate_database(con)
-        con.execute(
-            """
-            INSERT OR IGNORE INTO admins (username, password, full_name)
-            VALUES (?, ?, ?)
-            """,
-            (ADMIN_USERNAME, ADMIN_PASSWORD, ADMIN_NAME),
-        )
+    return
 
 def safe_int_id(value):
     """Convertit un identifiant PostgreSQL/Pandas en entier sans faire planter l'application.
@@ -2790,7 +2772,14 @@ def generate_global_pdf():
 # INTERFACE
 # ============================================================
 
-init_db()
+_db_fingerprint = "|".join([SUPABASE_HOST, SUPABASE_PORT, SUPABASE_DATABASE, SUPABASE_USER, SUPABASE_PASSWORD[:8] if SUPABASE_PASSWORD else ""])
+try:
+    init_db(_db_fingerprint)
+except Exception as _db_exc:
+    st.error("❌ Connexion Supabase impossible")
+    st.code(str(_db_exc))
+    st.info("Vérifiez les secrets [postgres] et le paquet psycopg2-binary dans requirements.txt, puis redémarrez l'application.")
+    st.stop()
 
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -2909,6 +2898,22 @@ if st.sidebar.button("🔄 Actualiser les données"):
     except Exception:
         pass
     st.rerun()
+
+# État réel de la base utilisée par l'application.
+if use_supabase():
+    st.sidebar.success("🟢 Supabase PostgreSQL actif")
+    if st.sidebar.button("🔎 Tester Supabase"):
+        try:
+            row, tables = supabase_health_check()
+            missing_tables = [name for name, ok in tables.items() if not ok]
+            if missing_tables:
+                st.sidebar.error("Tables manquantes : " + ", ".join(missing_tables))
+            else:
+                st.sidebar.success("Supabase OK — base : " + str(row.get("db")))
+        except Exception as exc:
+            st.sidebar.error("Test Supabase échoué : " + str(exc))
+else:
+    st.sidebar.error("🔴 Supabase non configuré")
 
 st.sidebar.divider()
 
