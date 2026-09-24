@@ -2248,9 +2248,14 @@ def generate_member_pdf(member_id):
     cdf = contributions(member_id)
     ldf = loans(member_id)
 
-    total_saved = float(cdf["amount"].sum()) if not cdf.empty else 0
-    total_borrowed = float(ldf["principal"].sum()) if not ldf.empty else 0
-    total_due = float(ldf["total_due"].sum()) if not ldf.empty else 0
+    # Les colonnes peuvent être absentes ou contenir des valeurs texte/NULL.
+    # On normalise toujours les montants avant le calcul pour éviter le ValueError.
+    amount_series = pd.to_numeric(cdf.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    principal_series = pd.to_numeric(ldf.get("principal", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    due_series = pd.to_numeric(ldf.get("total_due", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    total_saved = float(amount_series.sum())
+    total_borrowed = float(principal_series.sum())
+    total_due = float(due_series.sum())
 
     buffer = BytesIO()
     doc = SimpleDocTemplate(
@@ -2353,21 +2358,22 @@ def generate_member_pdf(member_id):
 
     # Cotisations.
     story.append(Paragraph("Historique des cotisations", heading_style))
-    contribution_data = [["Date", "Mois", "Montant", "Note"]]
+    contribution_data = [["Date", "Membre", "Mois", "Montant", "Note"]]
     for _, row in cdf.iterrows():
         contribution_data.append([
-            str(row["payment_date"]),
-            str(row["month_label"]),
-            money(row["amount"]),
-            str(row["note"] or ""),
+            str(row.get("payment_date", "")),
+            str(member["full_name"]),
+            str(row.get("month_label", "")),
+            money(pd.to_numeric(row.get("amount", 0), errors="coerce") if pd.notna(row.get("amount", 0)) else 0),
+            str(row.get("note", "") or ""),
         ])
     if len(contribution_data) == 1:
-        contribution_data.append(["-", "-", "-", "Aucune cotisation enregistrée"])
+        contribution_data.append(["-", str(member["full_name"]), "-", "-", "Aucune cotisation enregistrée"])
 
     table = Table(
         contribution_data,
         repeatRows=1,
-        colWidths=[29 * mm, 29 * mm, 35 * mm, 86 * mm],
+        colWidths=[25 * mm, 40 * mm, 25 * mm, 32 * mm, 57 * mm],
     )
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(BRAND_NAVY)),
