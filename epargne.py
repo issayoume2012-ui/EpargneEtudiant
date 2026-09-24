@@ -619,6 +619,9 @@ def db():
         raw_con = pool.getconn()
         con = PostgresConnectionAdapter(raw_con)
         try:
+            raw_cur = raw_con.cursor()
+            raw_cur.execute("SET search_path TO public")
+            raw_cur.close()
             yield con
             raw_con.commit()
         except Exception:
@@ -652,9 +655,19 @@ def sql(query):
 
 
 def read_sql(query, params=None):
-    """Lecture SQL compatible avec les deux moteurs."""
+    """Lecture SQL robuste sans passer par pandas.read_sql_query."""
     with db() as con:
-        return pd.read_sql_query(sql(query), con, params=params or [])
+        cur = con.cursor()
+        cur.execute(sql(query), params or [])
+        rows = cur.fetchall()
+        description = cur.description or []
+        columns = [d[0] for d in description]
+        cur.close()
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    if isinstance(rows[0], dict):
+        return pd.DataFrame(rows, columns=columns)
+    return pd.DataFrame([tuple(r) for r in rows], columns=columns)
 
 
 def migrate_database(con):
@@ -1321,99 +1334,34 @@ def get_member_login_status():
     )
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=5, show_spinner=False)
 def member_account_data_cached(member_id):
-    """Lecture regroupée et temporairement mise en cache pour un membre."""
     member_id = int(member_id)
+    mt = 'public.members' if use_supabase() else 'members'
+    ct = 'public.contributions' if use_supabase() else 'contributions'
+    lt = 'public.loans' if use_supabase() else 'loans'
+    it = 'public.loan_installments' if use_supabase() else 'loan_installments'
 
-    with db() as con:
-        member_df = pd.read_sql_query(
-            """
-            SELECT id, full_name, phone, monthly_target, notes,
-                   active, member_username, member_login_active, created_at
-            FROM members
-            WHERE id=?
-            LIMIT 1
-            """,
-            con,
-            params=[member_id],
-        )
-
-        cdf = pd.read_sql_query(
-            """
-            SELECT c.id, c.member_id, m.full_name, c.payment_date,
-                   c.month_label, c.amount, c.note
-            FROM contributions c
-            JOIN members m ON m.id = c.member_id
-            WHERE c.member_id=?
-            ORDER BY c.payment_date DESC, c.id DESC
-            """,
-            con,
-            params=[member_id],
-        )
-
-        ldf = pd.read_sql_query(
-            """
-            SELECT l.id, l.member_id, m.full_name, l.loan_date,
-                   l.principal, l.interest_rate, l.total_due,
-                   l.duration_months, l.first_due_date, l.status, l.note
-            FROM loans l
-            JOIN members m ON m.id=l.member_id
-            WHERE l.member_id=?
-            ORDER BY l.loan_date DESC, l.id DESC
-            """,
-            con,
-            params=[member_id],
-        )
-
-        idf = pd.read_sql_query(
-            """
-            SELECT i.id, i.loan_id, i.installment_number, i.due_date,
-                   i.amount_due, i.amount_paid, i.payment_date, i.note
-            FROM loan_installments i
-            JOIN loans l ON l.id=i.loan_id
-            WHERE l.member_id=?
-            ORDER BY i.due_date, i.id
-            """,
-            con,
-            params=[member_id],
-        )
+    member_df = read_sql(f"SELECT id, full_name, phone, monthly_target, notes, active, member_username, member_login_active, created_at FROM {mt} WHERE id=? LIMIT 1", [member_id])
+    cdf = read_sql(f"SELECT c.id, c.member_id, m.full_name, c.payment_date, c.month_label, c.amount, c.note FROM {ct} c LEFT JOIN {mt} m ON m.id=c.member_id WHERE c.member_id=? ORDER BY c.payment_date DESC, c.id DESC", [member_id])
+    ldf = read_sql(f"SELECT l.id, l.member_id, m.full_name, l.loan_date, l.principal, l.interest_rate, l.total_due, l.duration_months, l.first_due_date, l.status, l.note FROM {lt} l LEFT JOIN {mt} m ON m.id=l.member_id WHERE l.member_id=? ORDER BY l.loan_date DESC, l.id DESC", [member_id])
+    idf = read_sql(f"SELECT i.id, i.loan_id, i.installment_number, i.due_date, i.amount_due, i.amount_paid, i.payment_date, i.note FROM {it} i JOIN {lt} l ON l.id=i.loan_id WHERE l.member_id=? ORDER BY i.due_date, i.id", [member_id])
 
     cdf = _clean_contributions_df(cdf)
-
+    for col in ('amount_due','amount_paid'):
+        if col in idf.columns:
+            idf[col] = pd.to_numeric(idf[col], errors='coerce').fillna(0)
     if not idf.empty:
-        idf["amount_due"] = pd.to_numeric(idf["amount_due"], errors="coerce").fillna(0)
-        idf["amount_paid"] = pd.to_numeric(idf["amount_paid"], errors="coerce").fillna(0)
-        idf["reste"] = (idf["amount_due"] - idf["amount_paid"]).clip(lower=0)
+        idf['reste'] = (idf['amount_due'] - idf['amount_paid']).clip(lower=0)
 
-    total_contributed = float(
-        pd.to_numeric(cdf.get("amount", pd.Series(dtype=float)), errors="coerce")
-        .fillna(0).sum()
-    )
-    total_borrowed = float(
-        pd.to_numeric(ldf.get("principal", pd.Series(dtype=float)), errors="coerce")
-        .fillna(0).sum()
-    )
-    total_received = float(
-        pd.to_numeric(idf.get("amount_paid", pd.Series(dtype=float)), errors="coerce")
-        .fillna(0).sum()
-    )
-    total_due = float(
-        pd.to_numeric(idf.get("amount_due", pd.Series(dtype=float)), errors="coerce")
-        .fillna(0).sum()
-    )
+    total_contributed = float(pd.to_numeric(cdf.get('amount', pd.Series(dtype=float)), errors='coerce').fillna(0).sum())
+    total_borrowed = float(pd.to_numeric(ldf.get('principal', pd.Series(dtype=float)), errors='coerce').fillna(0).sum())
+    total_received = float(pd.to_numeric(idf.get('amount_paid', pd.Series(dtype=float)), errors='coerce').fillna(0).sum())
+    total_due = float(pd.to_numeric(idf.get('amount_due', pd.Series(dtype=float)), errors='coerce').fillna(0).sum())
 
-    return {
-        "member": member_df,
-        "contributions": cdf,
-        "loans": ldf,
-        "installments": idf,
-        "total_contributed": total_contributed,
-        "total_borrowed": total_borrowed,
-        "total_received": total_received,
-        "outstanding": max(total_due - total_received, 0),
-    }
-
+    return {'member': member_df, 'contributions': cdf, 'loans': ldf, 'installments': idf,
+            'total_contributed': total_contributed, 'total_borrowed': total_borrowed,
+            'total_received': total_received, 'outstanding': max(total_due-total_received,0)}
 
 def member_account_data(member_id):
     """Retourne uniquement les données du membre authentifié."""
@@ -1550,18 +1498,7 @@ def get_members(active_only=False):
         ORDER BY lower(COALESCE(full_name, '')), id
     """
 
-    with db() as con:
-        if use_supabase():
-            cur = con.cursor()
-            cur.execute(query)
-            rows = cur.fetchall()
-            columns = [desc[0] for desc in cur.description]
-            cur.close()
-            df = pd.DataFrame(rows, columns=columns)
-        else:
-            df = pd.read_sql_query(query, con)
-
-    return _clean_members_df(df)
+    return _clean_members_df(read_sql(query))
 
 
 def add_member(name, phone, target, notes):
@@ -1666,36 +1603,33 @@ def update_member(member_id, name, phone, target, notes, active):
 # COTISATIONS
 # ============================================================
 
-def add_contribution(
-    member_id,
-    payment_date,
-    amount,
-    note
-):
-
+def add_contribution(member_id, payment_date, amount, note):
+    member_id = safe_int_id(member_id)
+    amount = float(amount)
+    if member_id is None:
+        raise ValueError('Membre invalide.')
+    if amount <= 0:
+        raise ValueError('Le montant de la cotisation doit être supérieur à 0.')
+    mt = 'public.members' if use_supabase() else 'members'
+    ct = 'public.contributions' if use_supabase() else 'contributions'
     with db() as con:
-        con.execute(
-            """
-            INSERT INTO contributions(
-                member_id,
-                payment_date,
-                amount,
-                month_label,
-                note
-            )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                member_id,
-                payment_date.isoformat(),
-                float(amount),
-                month_label(payment_date),
-                note.strip(),
-            )
-        )
+        member = con.execute(f'SELECT id, full_name FROM {mt} WHERE id=? LIMIT 1', (member_id,)).fetchone()
+        if not member:
+            raise ValueError('Le membre sélectionné est introuvable dans la base utilisée par l’application.')
+        if use_supabase():
+            row = con.execute(f"INSERT INTO {ct}(member_id,payment_date,amount,month_label,note) VALUES (?,?,?,?,?) RETURNING id", (member_id,payment_date.isoformat(),amount,month_label(payment_date),str(note or '').strip())).fetchone()
+            contribution_id = safe_int_id(row.get('id') if row else None)
+        else:
+            cur = con.execute(f"INSERT INTO {ct}(member_id,payment_date,amount,month_label,note) VALUES (?,?,?,?,?)", (member_id,payment_date.isoformat(),amount,month_label(payment_date),str(note or '').strip()))
+            contribution_id = safe_int_id(cur.lastrowid)
+        if contribution_id is None:
+            raise RuntimeError('La cotisation a été écrite mais son identifiant n’a pas pu être récupéré.')
+        verify = con.execute(f'SELECT id FROM {ct} WHERE id=? LIMIT 1', (contribution_id,)).fetchone()
+        if not verify:
+            raise RuntimeError('La base n’a pas confirmé la cotisation.')
         con.commit()
-        member_account_data_cached.clear()
-        refresh_application_data()
+    refresh_application_data()
+    return contribution_id
 
 
 def update_contribution(
@@ -1726,6 +1660,7 @@ def update_contribution(
         )
         con.commit()
         member_account_data_cached.clear()
+    refresh_application_data()
 
 
 def delete_contribution(contribution_id):
@@ -1736,6 +1671,7 @@ def delete_contribution(contribution_id):
             (contribution_id,)
         )
         con.commit()
+    refresh_application_data()
 
 
 def _clean_contributions_df(df):
@@ -1802,27 +1738,14 @@ def _clean_contributions_df(df):
 
 
 def contributions(member_id=None):
-    """Retourne les cotisations avec le nom réel du membre, sans lignes parasites."""
-    query = """
-        SELECT
-            c.id,
-            c.member_id,
-            m.full_name,
-            c.payment_date,
-            c.month_label,
-            c.amount,
-            c.note
-        FROM contributions c
-        JOIN members m ON m.id = c.member_id
-    """
-
-    params = []
+    ct = 'public.contributions' if use_supabase() else 'contributions'
+    mt = 'public.members' if use_supabase() else 'members'
+    query = f"SELECT c.id,c.member_id,m.full_name,c.payment_date,c.month_label,c.amount,c.note FROM {ct} c LEFT JOIN {mt} m ON m.id=c.member_id"
+    params=[]
     if member_id is not None:
-        query += " WHERE c.member_id=? "
-        params.append(member_id)
-
-    query += " ORDER BY c.payment_date DESC, c.id DESC "
-
+        query += ' WHERE c.member_id=?'
+        params.append(int(member_id))
+    query += ' ORDER BY c.payment_date DESC,c.id DESC'
     return _clean_contributions_df(read_sql(query, params))
 
 
@@ -1893,83 +1816,41 @@ def create_loan(
         if loan_id is None:
             raise RuntimeError("Impossible de récupérer l'identifiant du prêt créé.")
 
+        installment_table = 'public.loan_installments' if use_supabase() else 'loan_installments'
         for i in range(duration):
             due_date = add_months(first_due_date, i)
             amount = total_due - installment * (duration - 1) if i == duration - 1 else installment
             con.execute(
-                """
-                INSERT INTO loan_installments(
+                f"""INSERT INTO {installment_table}(
                     loan_id, installment_number, due_date, amount_due, amount_paid
-                )
-                VALUES (?, ?, ?, ?, 0)
-                """,
+                ) VALUES (?, ?, ?, ?, 0)""",
                 (loan_id, i + 1, due_date.isoformat(), round(amount, 2)),
             )
 
         con.commit()
-        return loan_id
+        loan_table = 'public.loans' if use_supabase() else 'loans'
+        verify = con.execute(f"SELECT id FROM {loan_table} WHERE id=? LIMIT 1", (loan_id,)).fetchone()
+        if not verify:
+            raise RuntimeError('La base n’a pas confirmé le prêt.')
+    refresh_application_data()
+    return loan_id
 
 
 def loans(member_id=None):
-
-    query = """
-        SELECT
-            l.id,
-            l.member_id,
-            m.full_name,
-            l.loan_date,
-            l.principal,
-            l.interest_rate,
-            l.total_due,
-            l.duration_months,
-            l.first_due_date,
-            l.status,
-            l.note
-        FROM loans l
-        JOIN members m
-            ON m.id=l.member_id
-    """
-
-    params = []
-
+    lt = 'public.loans' if use_supabase() else 'loans'
+    mt = 'public.members' if use_supabase() else 'members'
+    query = f"SELECT l.id,l.member_id,m.full_name,l.loan_date,l.principal,l.interest_rate,l.total_due,l.duration_months,l.first_due_date,l.status,l.note FROM {lt} l LEFT JOIN {mt} m ON m.id=l.member_id"
+    params=[]
     if member_id is not None:
-        query += " WHERE l.member_id=? "
-        params.append(member_id)
-
-    query += """
-        ORDER BY
-            l.loan_date DESC,
-            l.id DESC
-    """
-
-    with db() as con:
-        return pd.read_sql_query(
-            query,
-            con,
-            params=params
-        )
+        query += ' WHERE l.member_id=?'
+        params.append(int(member_id))
+    query += ' ORDER BY l.loan_date DESC,l.id DESC'
+    return read_sql(query, params)
 
 
 def get_installments(loan_id):
-
-    with db() as con:
-        return pd.read_sql_query(
-            """
-            SELECT
-                id,
-                loan_id,
-                due_date,
-                amount_due,
-                amount_paid,
-                payment_date,
-                note
-            FROM loan_installments
-            WHERE loan_id=?
-            ORDER BY due_date, id
-            """,
-            con,
-            params=[loan_id]
-        )
+    it = 'public.loan_installments' if use_supabase() else 'loan_installments'
+    return read_sql(f"SELECT id,loan_id,installment_number,due_date,amount_due,amount_paid,payment_date,note FROM {it} WHERE loan_id=? ORDER BY due_date,id", [int(loan_id)])
 
 
 def register_installment_payment(
@@ -1981,12 +1862,10 @@ def register_installment_payment(
 
     with db() as con:
 
+        it = 'public.loan_installments' if use_supabase() else 'loan_installments'
+        lt = 'public.loans' if use_supabase() else 'loans'
         row = con.execute(
-            """
-            SELECT loan_id
-            FROM loan_installments
-            WHERE id=?
-            """,
+            f"SELECT loan_id FROM {it} WHERE id=?",
             (installment_id,)
         ).fetchone()
 
@@ -1998,14 +1877,7 @@ def register_installment_payment(
         loan_id = row["loan_id"]
 
         con.execute(
-            """
-            UPDATE loan_installments
-            SET
-                amount_paid=?,
-                payment_date=?,
-                note=?
-            WHERE id=?
-            """,
+            f"UPDATE {it} SET amount_paid=?, payment_date=?, note=? WHERE id=?",
             (
                 float(amount_paid),
                 payment_date.isoformat(),
@@ -2015,13 +1887,7 @@ def register_installment_payment(
         )
 
         total = con.execute(
-            """
-            SELECT
-                SUM(amount_due) AS due,
-                SUM(amount_paid) AS paid
-            FROM loan_installments
-            WHERE loan_id=?
-            """,
+            f"SELECT SUM(amount_due) AS due, SUM(amount_paid) AS paid FROM {it} WHERE loan_id=?",
             (loan_id,)
         ).fetchone()
 
@@ -2035,11 +1901,7 @@ def register_installment_payment(
         )
 
         con.execute(
-            """
-            UPDATE loans
-            SET status=?
-            WHERE id=?
-            """,
+            f"UPDATE {lt} SET status=? WHERE id=?",
             (
                 status,
                 loan_id,
@@ -2047,6 +1909,7 @@ def register_installment_payment(
         )
 
         con.commit()
+    refresh_application_data()
 
 
 # ============================================================
@@ -2172,21 +2035,8 @@ def send_monthly_reminders():
 # ============================================================
 
 def get_admins():
-
-    with db() as con:
-        return pd.read_sql_query(
-            """
-            SELECT
-                id,
-                username,
-                full_name,
-                active,
-                created_at
-            FROM admins
-            ORDER BY full_name
-            """,
-            con
-        )
+    table = 'public.admins' if use_supabase() else 'admins'
+    return read_sql(f"SELECT id,username,full_name,active,created_at FROM {table} ORDER BY full_name")
 
 
 def add_admin(username, password, full_name):
@@ -2533,20 +2383,15 @@ def all_installments():
         tables = ('public.loan_installments', 'public.loans', 'public.members')
     else:
         tables = ('loan_installments', 'loans', 'members')
-    with db() as con:
-        return pd.read_sql_query(
-            f"""
-            SELECT
-                i.id, i.loan_id, i.installment_number, i.due_date,
-                i.amount_due, i.amount_paid, i.payment_date, i.note,
-                l.member_id, m.full_name
-            FROM {tables[0]} i
-            JOIN {tables[1]} l ON l.id=i.loan_id
-            JOIN {tables[2]} m ON m.id=l.member_id
-            ORDER BY i.due_date, i.id
-            """,
-            con,
-        )
+    return read_sql(f"""
+        SELECT i.id, i.loan_id, i.installment_number, i.due_date,
+               i.amount_due, i.amount_paid, i.payment_date, i.note,
+               l.member_id, m.full_name
+        FROM {tables[0]} i
+        JOIN {tables[1]} l ON l.id=i.loan_id
+        JOIN {tables[2]} m ON m.id=l.member_id
+        ORDER BY i.due_date, i.id
+    """)
 
 
 def global_report_data():
