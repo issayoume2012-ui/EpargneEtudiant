@@ -876,6 +876,16 @@ def create_supabase_schema():
                OR member_login_active IS NULL
         """)
 
+        # Nettoyage des anciennes lignes d'en-tête importées par erreur
+        # (ex. full_name / phone / monthly_target / notes). Elles ne sont
+        # pas de vrais membres et provoquent des sélections impossibles.
+        cur.execute("""
+            DELETE FROM public.members
+            WHERE lower(trim(COALESCE(full_name, ''))) IN ('full_name', 'nom complet', 'nom_complet')
+              AND lower(trim(COALESCE(phone, ''))) IN ('phone', 'telephone', 'téléphone')
+              AND lower(trim(COALESCE(notes, ''))) IN ('notes', 'note')
+        """)
+
         # ------------------------------------------------------------
         # 3. Index APRES création/migration des colonnes.
         # ------------------------------------------------------------
@@ -1486,29 +1496,83 @@ def member_account_page(member_id):
 # MEMBRES
 # ============================================================
 
-def get_members(active_only=False):
+def _clean_members_df(df):
+    """Nettoie les lignes membres corrompues sans supprimer les vrais membres."""
+    expected = [
+        "id", "full_name", "phone", "monthly_target", "notes",
+        "active", "member_username", "member_login_active", "created_at"
+    ]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=expected)
 
+    df = df.copy()
+    for col in expected:
+        if col not in df.columns:
+            df[col] = None
+
+    def norm(v):
+        if v is None:
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except Exception:
+            pass
+        return str(v).strip().lower()
+
+    # Supprime les anciennes lignes qui correspondent littéralement aux
+    # noms de colonnes (visible dans Supabase : id/full_name/phone/...).
+    bad_header_rows = (
+        df["full_name"].map(norm).isin({"", "full_name", "nom complet", "nom_complet"})
+        & df["phone"].map(norm).isin({"", "phone", "telephone", "téléphone"})
+        & df["notes"].map(norm).isin({"", "notes", "note"})
+    )
+
+    # Une ligne sans nom ne doit jamais être proposée comme membre.
+    missing_name = df["full_name"].map(norm).eq("")
+    df = df.loc[~(bad_header_rows | missing_name)].copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=expected)
+
+    df["full_name"] = df["full_name"].astype(str).str.strip()
+    df["phone"] = df["phone"].fillna("").astype(str).str.strip()
+    return df.sort_values("full_name", kind="stable").reset_index(drop=True)
+
+
+def build_member_options(df, include_phone=True):
+    """Construit des choix stables et uniques : le nom affiché n'est jamais la clé DB."""
+    options = {}
+    if df is None or df.empty:
+        return options
+
+    for _, row in df.iterrows():
+        member_id = safe_int_id(row.get("id"))
+        name = str(row.get("full_name") or "").strip()
+        if member_id is None or not name:
+            continue
+        phone = str(row.get("phone") or "").strip()
+        label = f"{name} — {phone}" if include_phone and phone else name
+        # L'ID rend le libellé unique même si deux membres ont le même nom/téléphone.
+        label = f"{label} · ID {member_id}"
+        options[label] = member_id
+    return options
+
+
+def get_members(active_only=False):
     query = """
         SELECT
-            id,
-            full_name,
-            phone,
-            monthly_target,
-            notes,
-            active,
-            member_username,
-            member_login_active,
-            created_at
+            id, full_name, phone, monthly_target, notes, active,
+            member_username, member_login_active, created_at
         FROM members
     """
-
     if active_only:
         query += " WHERE active=TRUE "
-
     query += " ORDER BY full_name "
 
     with db() as con:
-        return pd.read_sql_query(query, con)
+        df = pd.read_sql_query(query, con)
+    return _clean_members_df(df)
 
 
 def add_member(name, phone, target, notes):
@@ -2941,11 +3005,7 @@ elif page == "Membres":
 
         st.subheader("Modifier un membre")
 
-        options = {
-            f"{r['full_name']} — {r['phone']}": rid
-            for _, r in df.iterrows()
-            if (rid := safe_int_id(r.get("id"))) is not None
-        }
+        options = build_member_options(df)
 
         option_labels = list(options.keys())
         if not option_labels:
@@ -3036,11 +3096,7 @@ elif page == "Cotisations":
 
     else:
 
-        member_options = {
-            f"{r['full_name']} — {r['phone']}": rid
-            for _, r in mdf.iterrows()
-            if (rid := safe_int_id(r.get("id"))) is not None
-        }
+        member_options = build_member_options(mdf)
 
         with st.form("contribution_form"):
 
@@ -3049,7 +3105,10 @@ elif page == "Cotisations":
                 list(member_options.keys())
             )
 
-            member_id = member_options[selected]
+            member_id = member_options.get(selected)
+            if member_id is None:
+                st.warning("Le membre sélectionné n'est plus disponible. Actualisez la page.")
+                st.stop()
 
             payment_date = st.date_input(
                 "Date réelle du paiement",
@@ -3352,18 +3411,30 @@ elif page == "Rappels WhatsApp":
 
     if not mdf.empty:
 
-        options = {
-            f"{r['full_name']} — +{normalize_phone(r['phone'])}":
-            r
-            for _, r in mdf.iterrows()
-        }
+        options = {}
+        for _, r in mdf.iterrows():
+            member_id = safe_int_id(r.get("id"))
+            name = str(r.get("full_name") or "").strip()
+            if member_id is None or not name:
+                continue
+            phone = normalize_phone(r.get("phone"))
+            label = f"{name} — +{phone}" if phone else name
+            options[f"{label} · ID {member_id}"] = r
+
+        if not options:
+            st.info("Aucun membre actif avec un nom valide.")
+            st.stop()
 
         selected = st.selectbox(
             "Membre",
-            list(options.keys())
+            list(options.keys()),
+            key="whatsapp_member_select"
         )
 
-        member = options[selected]
+        member = options.get(selected)
+        if member is None:
+            st.warning("Le membre sélectionné n'est plus disponible. Actualisez la page.")
+            st.stop()
 
         message = contribution_message(
             member["full_name"]
@@ -3540,13 +3611,19 @@ elif page == "Administrateurs":
         if members_df.empty:
             st.warning("Ajoutez d'abord un membre dans le menu Membres.")
         else:
-            member_options = {
-                f"{r['full_name']} — #{rid}": rid
-                for _, r in members_df.iterrows()
-                if (rid := safe_int_id(r.get("id"))) is not None
-            }
-            selected_label = st.selectbox("Membre à authentifier", list(member_options.keys()))
-            selected_member_id = member_options[selected_label]
+            member_options = build_member_options(members_df, include_phone=False)
+            if not member_options:
+                st.info("Aucun membre avec un nom et un identifiant valides. Ajoutez d'abord un membre.")
+                st.stop()
+            selected_label = st.selectbox(
+                "Membre à authentifier",
+                list(member_options.keys()),
+                key="admin_member_account_select"
+            )
+            selected_member_id = member_options.get(selected_label)
+            if selected_member_id is None:
+                st.warning("Le membre sélectionné n'est plus disponible. Actualisez la page.")
+                st.stop()
             current = members_df[members_df["id"] == selected_member_id].iloc[0]
             with st.form("member_account_form"):
                 member_login = st.text_input("Identifiant membre", value=str(current.get("member_username") or ""), placeholder="ex. issa.membre")
