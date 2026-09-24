@@ -1507,21 +1507,58 @@ def build_member_options(df, include_phone=True):
     return options
 
 
+def refresh_application_data():
+    """Force Streamlit à relire les données Supabase immédiatement."""
+    try:
+        member_account_data_cached.clear()
+    except Exception:
+        pass
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+
 def get_members(active_only=False):
-    """Lecture fraîche des membres depuis la table publique Supabase."""
-    table = 'public.members' if use_supabase() else 'members'
+    """
+    Lecture fraîche des membres depuis la base réellement utilisée.
+    Important : cette fonction n'est pas mise en cache, afin qu'un membre
+    ajouté dans Supabase apparaisse immédiatement après le rerun Streamlit.
+    """
+    table = "public.members" if use_supabase() else "members"
+
+    if use_supabase():
+        active_clause = "WHERE active IS NOT FALSE" if active_only else ""
+    else:
+        active_clause = "WHERE COALESCE(active, 1)=1" if active_only else ""
+
     query = f"""
         SELECT
-            id, full_name, phone, monthly_target, notes, active,
-            member_username, member_login_active, created_at
+            id,
+            full_name,
+            phone,
+            monthly_target,
+            notes,
+            active,
+            member_username,
+            member_login_active,
+            created_at
         FROM {table}
+        {active_clause}
+        ORDER BY lower(COALESCE(full_name, '')), id
     """
-    if active_only:
-        query += " WHERE COALESCE(active, TRUE)=TRUE "
-    query += " ORDER BY lower(COALESCE(full_name, '')), id "
 
     with db() as con:
-        df = pd.read_sql_query(query, con)
+        if use_supabase():
+            cur = con.cursor()
+            cur.execute(query)
+            rows = cur.fetchall()
+            columns = [desc[0] for desc in cur.description]
+            cur.close()
+            df = pd.DataFrame(rows, columns=columns)
+        else:
+            df = pd.read_sql_query(query, con)
+
     return _clean_members_df(df)
 
 
@@ -2893,10 +2930,7 @@ if st.sidebar.button("Se déconnecter"):
     st.rerun()
 
 if st.sidebar.button("🔄 Actualiser les données"):
-    try:
-        member_account_data_cached.clear()
-    except Exception:
-        pass
+    refresh_application_data()
     st.rerun()
 
 # État réel de la base utilisée par l'application.
@@ -2996,7 +3030,10 @@ elif page == "Membres":
                         target,
                         notes
                     )
-                    st.session_state["member_flash"] = f"Membre ajouté avec succès — ID {new_member_id}."
+                    refresh_application_data()
+                    st.session_state["member_flash"] = (
+                        f"Membre ajouté avec succès — ID {new_member_id}."
+                    )
                     st.rerun()
 
                 except Exception as exc:
@@ -3010,6 +3047,22 @@ elif page == "Membres":
     st.divider()
 
     df = get_members(False)
+
+    if df.empty:
+        st.warning("Aucun membre trouvé dans la base utilisée par l'application.")
+        if use_supabase():
+            try:
+                with db() as con:
+                    count_row = con.execute(
+                        "SELECT COUNT(*) AS total FROM public.members"
+                    ).fetchone()
+                total_db = int(count_row["total"]) if count_row else 0
+                st.caption(
+                    f"Diagnostic Supabase : {total_db} ligne(s) présente(s) "
+                    "dans public.members."
+                )
+            except Exception as exc:
+                st.error(f"Lecture de public.members impossible : {exc}")
 
     st.dataframe(
         df,
@@ -3107,7 +3160,12 @@ elif page == "Cotisations":
     if mdf.empty:
 
         st.warning(
-            "Ajoutez d'abord un membre."
+            "Aucun membre actif trouvé."
+        )
+        st.info(
+            "Si le membre apparaît dans Supabase mais pas ici, utilisez "
+            "« 🔄 Actualiser les données » dans la barre latérale. "
+            "Les membres avec active = TRUE ou NULL sont considérés comme actifs."
         )
 
     else:
@@ -3184,7 +3242,12 @@ elif page == "Emprunts":
     if mdf.empty:
 
         st.warning(
-            "Ajoutez d'abord un membre."
+            "Aucun membre actif trouvé."
+        )
+        st.info(
+            "Si le membre apparaît dans Supabase mais pas ici, utilisez "
+            "« 🔄 Actualiser les données » dans la barre latérale. "
+            "Les membres avec active = TRUE ou NULL sont considérés comme actifs."
         )
 
     else:
