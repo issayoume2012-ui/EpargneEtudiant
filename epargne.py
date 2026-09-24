@@ -337,26 +337,47 @@ inject_brand_css()
 
 
 class PostgresCursorAdapter:
+    """Adaptateur compatible avec sqlite3 tout en utilisant psycopg2."""
+
     def __init__(self, cursor):
         self.cursor = cursor
 
     def execute(self, query, params=None):
-        return self.cursor.execute(query.replace("?", "%s"), params)
+        self.cursor.execute(query.replace("?", "%s"), params)
+        return self
 
     def executemany(self, query, params=None):
-        return self.cursor.executemany(query.replace("?", "%s"), params)
+        self.cursor.executemany(query.replace("?", "%s"), params)
+        return self
 
     def fetchone(self):
         return self.cursor.fetchone()
 
+    def fetchmany(self, size=None):
+        return self.cursor.fetchmany() if size is None else self.cursor.fetchmany(size)
+
     def fetchall(self):
         return self.cursor.fetchall()
+
+    def close(self):
+        return self.cursor.close()
 
     def __iter__(self):
         return iter(self.cursor)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def __getattr__(self, name):
+        return getattr(self.cursor, name)
+
 
 class PostgresConnectionAdapter:
+    """Connexion PostgreSQL avec une API proche de sqlite3."""
+
     def __init__(self, con):
         self._con = con
 
@@ -364,10 +385,14 @@ class PostgresConnectionAdapter:
         return PostgresCursorAdapter(self._con.cursor(*args, **kwargs))
 
     def execute(self, query, params=None):
-        return self._con.cursor().execute(query.replace("?", "%s"), params)
+        cur = self.cursor()
+        cur.execute(query, params)
+        return cur
 
     def executemany(self, query, params=None):
-        return self._con.cursor().executemany(query.replace("?", "%s"), params)
+        cur = self.cursor()
+        cur.executemany(query, params)
+        return cur
 
     def commit(self):
         return self._con.commit()
@@ -377,6 +402,15 @@ class PostgresConnectionAdapter:
 
     def close(self):
         return self._con.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
 
 
 def postgres_dsn():
