@@ -2812,68 +2812,178 @@ if st.session_state.user is None:
     st.stop()
 
 # ============================================================
-# SIDEBAR
+# BARRE DE NAVIGATION SUPÉRIEURE
 # ============================================================
 
 user_role = st.session_state.user.get("role", "admin")
 
-st.sidebar.markdown(
+# Navigation principale en haut de page : aucun menu latéral.
+st.markdown(
     """
-    <div style="text-align:center; padding:10px 0 18px 0;">
-        <div style="font-size:2.4rem;">🐷</div>
-        <div style="font-size:1.25rem; font-weight:900;">Épargne Étudiant</div>
-        <div style="opacity:.82; font-size:.85rem;">Petits efforts, grands projets</div>
-    </div>
+    <style>
+    /* Supprime complètement l'ancien panneau latéral. */
+    [data-testid="stSidebar"] {
+        display: none !important;
+    }
+
+    /* La zone principale reprend toute la largeur. */
+    [data-testid="stAppViewContainer"] > .main {
+        margin-left: 0 !important;
+    }
+
+    .top-navigation {
+        position: sticky;
+        top: 0;
+        z-index: 999;
+        margin: -1rem -1rem 1.25rem -1rem;
+        padding: 12px 20px 10px 20px;
+        background: rgba(255,255,255,.96);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border-bottom: 1px solid rgba(18,42,85,.10);
+        box-shadow: 0 8px 24px rgba(18,42,85,.08);
+    }
+
+    .top-brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-height: 42px;
+    }
+
+    .top-brand-icon {
+        font-size: 1.9rem;
+        line-height: 1;
+    }
+
+    .top-brand-name {
+        color: #122A55;
+        font-size: 1.12rem;
+        font-weight: 900;
+        line-height: 1.1;
+    }
+
+    .top-brand-subtitle {
+        color: #64748B;
+        font-size: .72rem;
+        margin-top: 2px;
+    }
+
+    /* Style du radio horizontal utilisé comme menu. */
+    div[data-testid="stRadio"] > label {
+        display: none;
+    }
+
+    div[data-testid="stRadio"] > div {
+        gap: 5px !important;
+        flex-wrap: wrap !important;
+    }
+
+    div[data-testid="stRadio"] [role="radiogroup"] {
+        gap: 5px !important;
+        flex-wrap: wrap !important;
+    }
+
+    div[data-testid="stRadio"] label {
+        border-radius: 999px !important;
+        padding: 7px 13px !important;
+        border: 1px solid transparent !important;
+        transition: all .18s ease;
+    }
+
+    div[data-testid="stRadio"] label:hover {
+        background: #EEF7FD !important;
+        border-color: rgba(18,42,85,.10) !important;
+    }
+
+    .top-user {
+        text-align: right;
+        color: #475569;
+        font-size: .78rem;
+        padding-top: 4px;
+    }
+
+    @media (max-width: 900px) {
+        .top-navigation {
+            margin-left: -0.5rem;
+            margin-right: -0.5rem;
+            padding-left: 10px;
+            padding-right: 10px;
+        }
+        .top-user {
+            text-align: left;
+            margin-top: 4px;
+        }
+    }
+    </style>
     """,
     unsafe_allow_html=True,
 )
-st.sidebar.success(
-    f"Connecté : {st.session_state.user['full_name']}"
-)
 
-if st.sidebar.button("Se déconnecter"):
-    st.session_state.user = None
-    st.rerun()
+st.markdown('<div class="top-navigation">', unsafe_allow_html=True)
 
-if st.sidebar.button("🔄 Actualiser les données"):
-    refresh_application_data()
-    st.rerun()
+brand_col, user_col = st.columns([2.4, 1.2], vertical_alignment="center")
 
-# État réel de la base utilisée par l'application.
-if use_supabase():
-    st.sidebar.success("🟢 Supabase PostgreSQL actif")
-    if st.sidebar.button("🔎 Tester Supabase"):
-        try:
-            row, tables = supabase_health_check()
-            missing_tables = [name for name, ok in tables.items() if not ok]
-            if missing_tables:
-                st.sidebar.error("Tables manquantes : " + ", ".join(missing_tables))
-            else:
-                st.sidebar.success("Supabase OK — base : " + str(row.get("db")))
-        except Exception as exc:
-            st.sidebar.error("Test Supabase échoué : " + str(exc))
-else:
-    st.sidebar.error("🔴 Supabase non configuré")
+with brand_col:
+    st.markdown(
+        """
+        <div class="top-brand">
+            <div class="top-brand-icon">🐷</div>
+            <div>
+                <div class="top-brand-name">Épargne Étudiant</div>
+                <div class="top-brand-subtitle">Petits efforts, grands projets</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-st.sidebar.divider()
+with user_col:
+    st.markdown(
+        f'<div class="top-user">👤 <strong>{st.session_state.user["full_name"]}</strong></div>',
+        unsafe_allow_html=True,
+    )
 
 if user_role == "member":
     page = "Mon compte"
-    st.sidebar.info("👤 Espace membre — lecture seule")
+    st.info("👤 Espace membre — lecture seule")
 else:
-    page = st.sidebar.radio(
-        "Menu",
-        [
-            "Tableau de bord",
-            "Membres",
-            "Cotisations",
-            "Emprunts",
-            "Rappels WhatsApp",
-            "Rapport global",
-            "Bulletins PDF",
-            "Administrateurs",
-        ]
+    pages = [
+        "Tableau de bord",
+        "Membres",
+        "Cotisations",
+        "Emprunts",
+        "Rappels WhatsApp",
+        "Rapport global",
+        "Bulletins PDF",
+        "Administrateurs",
+    ]
+
+    page = st.radio(
+        "Menu principal",
+        pages,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="top_navigation_page",
     )
+
+# Actions globales dans la barre supérieure.
+action_col1, action_col2, action_col3 = st.columns([1, 1, 5])
+with action_col1:
+    if st.button("🔄 Actualiser", use_container_width=True, key="top_refresh"):
+        refresh_application_data()
+        st.rerun()
+with action_col2:
+    if st.button("↪ Déconnexion", use_container_width=True, key="top_logout"):
+        st.session_state.user = None
+        st.rerun()
+
+if use_supabase():
+    st.caption("🟢 Supabase PostgreSQL connecté")
+else:
+    st.caption("🔴 Supabase PostgreSQL non configuré")
+
+st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ============================================================
