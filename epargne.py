@@ -2947,12 +2947,21 @@ elif page == "Membres":
             if (rid := safe_int_id(r.get("id"))) is not None
         }
 
+        option_labels = list(options.keys())
+        if not option_labels:
+            st.warning("Aucun membre sélectionnable.")
+            st.stop()
+
         selected = st.selectbox(
             "Membre",
-            list(options.keys())
+            option_labels,
+            index=0
         )
 
-        member_id = options[selected]
+        member_id = options.get(selected)
+        if member_id is None:
+            st.warning("Le membre sélectionné n'est plus disponible. Actualisez la page.")
+            st.stop()
 
         row = df[
             df["id"] == member_id
@@ -3113,12 +3122,22 @@ elif page == "Emprunts":
 
         with st.form("loan_form"):
 
+            option_labels = list(options.keys())
+            if not option_labels:
+                st.warning("Aucun membre sélectionnable.")
+                st.stop()
+
             selected = st.selectbox(
                 "Membre",
-                list(options.keys())
+                option_labels,
+                index=0,
+                key="loan_member_select"
             )
 
-            member_id = options[selected]
+            member_id = options.get(selected)
+            if member_id is None:
+                st.warning("Le membre sélectionné n'est plus disponible. Actualisez la page.")
+                st.stop()
 
             loan_date = st.date_input(
                 "Date du prêt",
@@ -3458,12 +3477,22 @@ elif page == "Bulletins PDF":
             if (rid := safe_int_id(r.get("id"))) is not None
         }
 
+        option_labels = list(options.keys())
+        if not option_labels:
+            st.warning("Aucun membre disponible pour générer un bulletin.")
+            st.stop()
+
         selected = st.selectbox(
             "Membre",
-            list(options.keys())
+            option_labels,
+            index=0,
+            key="bulletin_member_select"
         )
 
-        member_id = options[selected]
+        member_id = options.get(selected)
+        if member_id is None:
+            st.warning("Le membre sélectionné n'est plus disponible. Actualisez la page.")
+            st.stop()
 
         pdf = generate_member_pdf(
             member_id
