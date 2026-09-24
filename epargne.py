@@ -390,35 +390,6 @@ def asset_image_html(css_class="brand-photo-wrap", alt="Épargne Étudiant"):
 
 def brand_hero(title="Épargne Étudiant", subtitle="Petits efforts, grands projets !", compact=False):
     if ASSET_IMAGE.exists():
-        left, right = st.columns([1.35, 0.65] if not compact else [1.6, 0.7], gap="large")
-        with left:
-            st.markdown(
-                f"""
-                <div class="brand-hero">
-                    <div class="brand-kicker">Épargne Étudiant</div>
-                    <div class="brand-title">{title}</div>
-                    <p class="brand-subtitle">{subtitle}</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        with right:
-            st.markdown(asset_image_html(), unsafe_allow_html=True)
-    else:
-        st.markdown(
-            f"""
-            <div class="brand-hero">
-                <div class="brand-kicker">Épargne Étudiant</div>
-                <div class="brand-title">{title}</div>
-                <p class="brand-subtitle">{subtitle}</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-
-def brand_hero(title="Épargne Étudiant", subtitle="Petits efforts, grands projets !", compact=False):
-    if ASSET_IMAGE.exists():
         left, right = st.columns([1.15, 0.85] if not compact else [1.5, 0.5])
         with left:
             st.markdown(
@@ -978,11 +949,6 @@ def create_supabase_schema():
 
         cur.close()
 
-
-def database_status():
-    if use_supabase():
-        return "Supabase PostgreSQL"
-    return "SQLite local (secours)"
 
 def database_status():
     if use_supabase():
@@ -1560,15 +1526,17 @@ def build_member_options(df, include_phone=True):
 
 
 def get_members(active_only=False):
-    query = """
+    """Lecture fraîche des membres depuis la table publique Supabase."""
+    table = 'public.members' if use_supabase() else 'members'
+    query = f"""
         SELECT
             id, full_name, phone, monthly_target, notes, active,
             member_username, member_login_active, created_at
-        FROM members
+        FROM {table}
     """
     if active_only:
-        query += " WHERE active=TRUE "
-    query += " ORDER BY full_name "
+        query += " WHERE COALESCE(active, TRUE)=TRUE "
+    query += " ORDER BY lower(COALESCE(full_name, '')), id "
 
     with db() as con:
         df = pd.read_sql_query(query, con)
@@ -1576,69 +1544,101 @@ def get_members(active_only=False):
 
 
 def add_member(name, phone, target, notes):
+    """Ajoute un membre et vérifie immédiatement qu'il est réellement présent."""
+    clean_name = str(name or '').strip()
+    clean_phone = normalize_phone(phone)
+    clean_notes = str(notes or '').strip()
 
-    phone = normalize_phone(phone)
+    if not clean_name:
+        raise ValueError("Le nom complet du membre est obligatoire.")
+    if not clean_phone or len(clean_phone) != 12 or not clean_phone.startswith(COUNTRY_CODE):
+        raise ValueError("Le numéro WhatsApp doit être un numéro sénégalais valide de 9 chiffres.")
 
-    if not name.strip():
-        raise ValueError("Le nom du membre est obligatoire.")
+    target_value = float(target or 0)
+    if target_value < 0:
+        raise ValueError("L'objectif mensuel ne peut pas être négatif.")
 
-    if not phone:
-        raise ValueError("Le numéro WhatsApp est obligatoire.")
-
+    table = 'public.members' if use_supabase() else 'members'
     with db() as con:
-        con.execute(
-            """
-            INSERT INTO members(
-                full_name,
-                phone,
-                monthly_target,
-                notes
+        existing_rows = con.execute(
+            f"SELECT id, full_name, phone FROM {table} WHERE lower(trim(full_name))=lower(trim(?))",
+            (clean_name,),
+        ).fetchall()
+        for existing in existing_rows:
+            if normalize_phone(existing.get('phone') if hasattr(existing, 'get') else existing['phone']) == clean_phone:
+                raise ValueError(f"Ce membre existe déjà (ID {existing['id']}).")
+
+        if use_supabase():
+            row = con.execute(
+                f"""
+                INSERT INTO {table}
+                    (full_name, phone, monthly_target, notes, active, member_login_active)
+                VALUES (?, ?, ?, ?, TRUE, FALSE)
+                RETURNING id, full_name, phone, monthly_target, notes, active, created_at
+                """,
+                (clean_name, clean_phone, target_value, clean_notes),
+            ).fetchone()
+            new_id = safe_int_id(row.get('id') if row else None)
+        else:
+            cursor = con.execute(
+                f"""INSERT INTO {table}
+                    (full_name, phone, monthly_target, notes, active, member_login_active)
+                   VALUES (?, ?, ?, ?, 1, 0)""",
+                (clean_name, clean_phone, target_value, clean_notes),
             )
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                name.strip(),
-                phone,
-                float(target or 0),
-                notes.strip(),
+            new_id = safe_int_id(cursor.lastrowid)
+
+        if new_id is None:
+            raise RuntimeError("Le membre n'a pas pu être créé dans la base de données.")
+
+        verify = con.execute(
+            f"SELECT id FROM {table} WHERE id=? LIMIT 1",
+            (new_id,),
+        ).fetchone()
+        if not verify:
+            raise RuntimeError("La base n'a pas confirmé l'enregistrement du membre.")
+
+        con.commit()
+        return new_id
+
+
+def update_member(member_id, name, phone, target, notes, active):
+    member_id = safe_int_id(member_id)
+    if member_id is None:
+        raise ValueError("Identifiant membre invalide.")
+
+    clean_name = str(name or '').strip()
+    clean_phone = normalize_phone(phone)
+    if not clean_name:
+        raise ValueError("Le nom complet du membre est obligatoire.")
+    if not clean_phone or len(clean_phone) != 12 or not clean_phone.startswith(COUNTRY_CODE):
+        raise ValueError("Le numéro WhatsApp doit être un numéro sénégalais valide de 9 chiffres.")
+
+    table = 'public.members' if use_supabase() else 'members'
+    with db() as con:
+        if use_supabase():
+            row = con.execute(
+                f"""UPDATE {table}
+                    SET full_name=?, phone=?, monthly_target=?, notes=?, active=?
+                    WHERE id=?
+                    RETURNING id""",
+                (clean_name, clean_phone, float(target or 0), str(notes or '').strip(), bool(active), member_id),
+            ).fetchone()
+            updated_id = safe_int_id(row.get('id') if row else None)
+        else:
+            cursor = con.execute(
+                f"""UPDATE {table}
+                    SET full_name=?, phone=?, monthly_target=?, notes=?, active=?
+                    WHERE id=?""",
+                (clean_name, clean_phone, float(target or 0), str(notes or '').strip(), int(bool(active)), member_id),
             )
-        )
+            updated_id = member_id if cursor.rowcount else None
+
+        if updated_id is None:
+            raise ValueError("Membre introuvable.")
         con.commit()
         member_account_data_cached.clear()
-
-
-def update_member(
-    member_id,
-    name,
-    phone,
-    target,
-    notes,
-    active
-):
-
-    with db() as con:
-        con.execute(
-            """
-            UPDATE members
-            SET
-                full_name=?,
-                phone=?,
-                monthly_target=?,
-                notes=?,
-                active=?
-            WHERE id=?
-            """,
-            (
-                name.strip(),
-                normalize_phone(phone),
-                float(target or 0),
-                notes.strip(),
-                bool(active),
-                member_id,
-            )
-        )
-        con.commit()
-        member_account_data_cached.clear()
+        return updated_id
 
 
 # ============================================================
@@ -1757,85 +1757,83 @@ def contributions(member_id=None):
 # ============================================================
 
 def create_loan(
-    member_id,
-    loan_date,
-    principal,
-    rate,
-    duration,
-    first_due_date,
-    note
+    member_id, loan_date, principal, rate, duration, first_due_date, note
 ):
-
+    member_id = safe_int_id(member_id)
     principal = float(principal)
     rate = float(rate)
     duration = int(duration)
 
-    total_due = principal * (1 + rate / 100)
+    if member_id is None:
+        raise ValueError("Membre invalide.")
+    if principal <= 0:
+        raise ValueError("Le montant du prêt doit être supérieur à 0.")
+    if rate < 0:
+        raise ValueError("Le taux ne peut pas être négatif.")
+    if duration < 1 or duration > 60:
+        raise ValueError("Le nombre d'échéances doit être compris entre 1 et 60.")
+
+    total_due = principal * (1 + rate / 100.0)
     installment = total_due / duration
 
     with db() as con:
+        member_table = 'public.members' if use_supabase() else 'members'
+        active_clause = "COALESCE(active, TRUE)=TRUE" if use_supabase() else "COALESCE(active, 1)=1"
+        member = con.execute(
+            f"SELECT id FROM {member_table} WHERE id=? AND {active_clause} LIMIT 1",
+            (member_id,),
+        ).fetchone()
+        if not member:
+            raise ValueError("Le membre sélectionné n'existe pas ou est inactif.")
 
-        cursor = con.execute(
-            """
-            INSERT INTO loans(
-                member_id,
-                loan_date,
-                principal,
-                interest_rate,
-                total_due,
-                duration_months,
-                first_due_date,
-                note
+        if use_supabase():
+            cursor = con.execute(
+                """
+                INSERT INTO public.loans(
+                    member_id, loan_date, principal, interest_rate, total_due,
+                    duration_months, first_due_date, status, note,
+                    total_interest_rate, installments_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'Actif', ?, ?, ?)
+                RETURNING id
+                """,
+                (member_id, loan_date.isoformat(), principal, rate, total_due, duration,
+                 first_due_date.isoformat(), str(note or '').strip(), rate, duration),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                member_id,
-                loan_date.isoformat(),
-                principal,
-                rate,
-                total_due,
-                duration,
-                first_due_date.isoformat(),
-                note.strip(),
+            loan_row = cursor.fetchone()
+            loan_id = safe_int_id(loan_row['id']) if loan_row else None
+        else:
+            cursor = con.execute(
+                """
+                INSERT INTO loans(
+                    member_id, loan_date, principal, interest_rate, total_due,
+                    duration_months, first_due_date, status, note
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'Actif', ?)
+                """,
+                (member_id, loan_date.isoformat(), principal, rate, total_due, duration,
+                 first_due_date.isoformat(), str(note or '').strip()),
             )
-        )
+            loan_id = safe_int_id(cursor.lastrowid)
 
-        loan_id = cursor.lastrowid
+        if loan_id is None:
+            raise RuntimeError("Impossible de récupérer l'identifiant du prêt créé.")
 
         for i in range(duration):
-
-            due_date = add_months(
-                first_due_date,
-                i
-            )
-
-            if i == duration - 1:
-                amount = (
-                    total_due
-                    - installment * (duration - 1)
-                )
-            else:
-                amount = installment
-
+            due_date = add_months(first_due_date, i)
+            amount = total_due - installment * (duration - 1) if i == duration - 1 else installment
             con.execute(
                 """
                 INSERT INTO loan_installments(
-                    loan_id,
-                    due_date,
-                    amount_due,
-                    amount_paid
+                    loan_id, installment_number, due_date, amount_due, amount_paid
                 )
-                VALUES (?, ?, ?, 0)
+                VALUES (?, ?, ?, ?, 0)
                 """,
-                (
-                    loan_id,
-                    due_date.isoformat(),
-                    round(amount, 2),
-                )
+                (loan_id, i + 1, due_date.isoformat(), round(amount, 2)),
             )
 
         con.commit()
+        return loan_id
 
 
 def loans(member_id=None):
@@ -2449,6 +2447,28 @@ def generate_member_pdf(member_id):
 # RAPPORT GLOBAL PDF + EXCEL
 # ============================================================
 
+def all_installments():
+    """Récupère toutes les échéances en une seule requête (évite le N+1)."""
+    if use_supabase():
+        tables = ('public.loan_installments', 'public.loans', 'public.members')
+    else:
+        tables = ('loan_installments', 'loans', 'members')
+    with db() as con:
+        return pd.read_sql_query(
+            f"""
+            SELECT
+                i.id, i.loan_id, i.installment_number, i.due_date,
+                i.amount_due, i.amount_paid, i.payment_date, i.note,
+                l.member_id, m.full_name
+            FROM {tables[0]} i
+            JOIN {tables[1]} l ON l.id=i.loan_id
+            JOIN {tables[2]} m ON m.id=l.member_id
+            ORDER BY i.due_date, i.id
+            """,
+            con,
+        )
+
+
 def global_report_data():
     """Construit une vue globale et détaillée de toute l'épargne enregistrée."""
     mdf = get_members(False).copy()
@@ -2460,27 +2480,11 @@ def global_report_data():
     if ldf.empty:
         ldf = pd.DataFrame(columns=["id", "member_id", "full_name", "loan_date", "principal", "interest_rate", "total_due", "duration_months", "first_due_date", "status", "note"])
 
-    # Échéances et remboursements enregistrés.
-    installments_frames = []
-    for _, loan in ldf.iterrows():
-        loan_id = safe_int_id(loan.get("id"))
-        member_id = safe_int_id(loan.get("member_id"))
-        if loan_id is None or member_id is None:
-            continue
-        try:
-            inst = get_installments(loan_id).copy()
-        except Exception:
-            inst = pd.DataFrame()
-        if not inst.empty:
-            inst["loan_id"] = loan_id
-            inst["member_id"] = member_id
-            inst["full_name"] = loan["full_name"]
-            installments_frames.append(inst)
-
-    if installments_frames:
-        idf = pd.concat(installments_frames, ignore_index=True)
-    else:
-        idf = pd.DataFrame(columns=["id", "loan_id", "due_date", "amount_due", "amount_paid", "payment_date", "note", "member_id", "full_name"])
+    # Échéances et remboursements enregistrés : une seule requête.
+    try:
+        idf = all_installments().copy()
+    except Exception:
+        idf = pd.DataFrame(columns=["id", "loan_id", "installment_number", "due_date", "amount_due", "amount_paid", "payment_date", "note", "member_id", "full_name"])
 
     total_contributed = float(pd.to_numeric(cdf.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
     total_borrowed = float(pd.to_numeric(ldf.get("principal", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
@@ -2899,6 +2903,13 @@ if st.sidebar.button("Se déconnecter"):
     st.session_state.user = None
     st.rerun()
 
+if st.sidebar.button("🔄 Actualiser les données"):
+    try:
+        member_account_data_cached.clear()
+    except Exception:
+        pass
+    st.rerun()
+
 st.sidebar.divider()
 
 if user_role == "member":
@@ -2974,22 +2985,22 @@ elif page == "Membres":
 
                 try:
 
-                    add_member(
+                    new_member_id = add_member(
                         name,
                         phone,
                         target,
                         notes
                     )
-
-                    st.success(
-                        "Membre ajouté."
-                    )
-
+                    st.session_state["member_flash"] = f"Membre ajouté avec succès — ID {new_member_id}."
                     st.rerun()
 
                 except Exception as exc:
 
                     st.error(str(exc))
+
+    member_flash = st.session_state.pop("member_flash", None)
+    if member_flash:
+        st.success(member_flash)
 
     st.divider()
 
@@ -3280,7 +3291,10 @@ elif page == "Emprunts":
                 list(loan_options.keys())
             )
 
-            loan_id = loan_options[loan_label]
+            loan_id = loan_options.get(loan_label)
+            if loan_id is None:
+                st.warning("Le prêt sélectionné n'est plus disponible. Actualisez les données.")
+                st.stop()
 
             idf = get_installments(loan_id)
 
@@ -3303,9 +3317,10 @@ elif page == "Emprunts":
                     list(installment_options.keys())
                 )
 
-                installment_id = installment_options[
-                    selected_installment
-                ]
+                installment_id = installment_options.get(selected_installment)
+                if installment_id is None:
+                    st.warning("L'échéance sélectionnée n'est plus disponible. Actualisez les données.")
+                    st.stop()
 
                 selected_row = idf[
                     idf["id"] == installment_id
