@@ -269,8 +269,8 @@ inject_brand_css()
 # BASE DE DONNÉES
 # ============================================================
 
-
 class PostgresCursorAdapter:
+    """Adaptateur PostgreSQL pour conserver les requêtes SQLite (?) de l'application."""
     def __init__(self, cursor):
         self.cursor = cursor
 
@@ -289,8 +289,12 @@ class PostgresCursorAdapter:
     def __iter__(self):
         return iter(self.cursor)
 
+    def __getattr__(self, name):
+        return getattr(self.cursor, name)
+
 
 class PostgresConnectionAdapter:
+    """Expose une API proche de sqlite3 tout en utilisant PostgreSQL."""
     def __init__(self, con):
         self._con = con
 
@@ -298,10 +302,14 @@ class PostgresConnectionAdapter:
         return PostgresCursorAdapter(self._con.cursor(*args, **kwargs))
 
     def execute(self, query, params=None):
-        return self._con.cursor().execute(query.replace("?", "%s"), params)
+        cur = self.cursor()
+        cur.execute(query, params)
+        return cur
 
     def executemany(self, query, params=None):
-        return self._con.cursor().executemany(query.replace("?", "%s"), params)
+        cur = self.cursor()
+        cur.executemany(query, params)
+        return cur
 
     def commit(self):
         return self._con.commit()
@@ -311,6 +319,9 @@ class PostgresConnectionAdapter:
 
     def close(self):
         return self._con.close()
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
 
 
 def postgres_dsn():
@@ -328,7 +339,6 @@ def postgres_dsn():
 
 
 def use_supabase():
-    """Indique si une connexion Supabase/PostgreSQL peut être utilisée."""
     configured = bool(
         SUPABASE_DB_URL
         or (
@@ -342,17 +352,21 @@ def use_supabase():
 
 @contextmanager
 def db():
-    """Connexion PostgreSQL Supabase si psycopg2 est installé, sinon SQLite."""
+    """Connexion Supabase/PostgreSQL si configurée, sinon SQLite."""
     if use_supabase():
-        con = psycopg2.connect(postgres_dsn(), cursor_factory=RealDictCursor)
+        raw = psycopg2.connect(
+            postgres_dsn(),
+            cursor_factory=RealDictCursor,
+        )
+        con = PostgresConnectionAdapter(raw)
         try:
             yield con
-            con.commit()
+            raw.commit()
         except Exception:
-            con.rollback()
+            raw.rollback()
             raise
         finally:
-            con.close()
+            raw.close()
     else:
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
@@ -368,87 +382,19 @@ def db():
 
 def sql(query):
     """Adapte les placeholders SQLite (?) vers PostgreSQL (%s)."""
-    if use_supabase():
-        return query.replace("?", "%s")
-    return query
+    return query.replace("?", "%s") if use_supabase() else query
 
 
 def read_sql(query, params=None):
-    """Lecture SQL compatible avec les deux moteurs."""
     with db() as con:
         return pd.read_sql_query(sql(query), con, params=params or [])
 
 
-def migrate_database(con):
-    """Migration de l'ancien schéma SQLite."""
-    if use_supabase():
-        return
-
-    def columns(table):
-        return {row["name"] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
-
-    specs = {
-        "members": {
-            "phone": "TEXT",
-            "monthly_target": "REAL DEFAULT 0",
-            "notes": "TEXT",
-            "active": "INTEGER DEFAULT 1",
-            "created_at": "TEXT",
-        },
-        "contributions": {
-            "payment_date": "TEXT",
-            "month_label": "TEXT",
-            "note": "TEXT",
-            "created_at": "TEXT",
-        },
-        "loans": {
-            "loan_date": "TEXT",
-            "total_interest_rate": "REAL DEFAULT 0",
-            "installments_count": "INTEGER DEFAULT 1",
-            "first_due_date": "TEXT",
-            "note": "TEXT",
-            "created_at": "TEXT",
-        },
-        "loan_installments": {
-            "due_date": "TEXT",
-            "paid_date": "TEXT",
-            "paid_amount": "REAL DEFAULT 0",
-            "note": "TEXT",
-            "created_at": "TEXT",
-        },
-    }
-
-    for table, fields in specs.items():
-        existing = columns(table)
-        for field, definition in fields.items():
-            if field not in existing:
-                con.execute(f"ALTER TABLE {table} ADD COLUMN {field} {definition}")
-
-    contribution_cols = columns("contributions")
-    if "payment_date" in contribution_cols:
-        if "date" in contribution_cols:
-            con.execute(
-                "UPDATE contributions SET payment_date = date "
-                "WHERE payment_date IS NULL OR payment_date = ''"
-            )
-        elif "contribution_date" in contribution_cols:
-            con.execute(
-                "UPDATE contributions SET payment_date = contribution_date "
-                "WHERE payment_date IS NULL OR payment_date = ''"
-            )
-        con.execute(
-            "UPDATE contributions SET payment_date = date('now') "
-            "WHERE payment_date IS NULL OR payment_date = ''"
-        )
-        con.execute(
-            "UPDATE contributions SET month_label = "
-            "strftime('%m/%Y', payment_date) "
-            "WHERE month_label IS NULL OR month_label = ''"
-        )
-
-
 def create_supabase_schema():
-    """Crée automatiquement toutes les tables Supabase au démarrage."""
+    """
+    Crée et met à niveau TOUT le schéma Supabase depuis le code.
+    Aucune création manuelle de table dans Supabase n'est nécessaire.
+    """
     if not use_supabase():
         return
 
@@ -479,8 +425,8 @@ def create_supabase_schema():
             id BIGSERIAL PRIMARY KEY,
             member_id BIGINT NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
             payment_date DATE NOT NULL,
-            month_label TEXT,
-            amount NUMERIC(14,2) NOT NULL,
+            amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+            month_label TEXT NOT NULL DEFAULT '',
             note TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
@@ -490,10 +436,12 @@ def create_supabase_schema():
             id BIGSERIAL PRIMARY KEY,
             member_id BIGINT NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
             loan_date DATE NOT NULL,
-            principal NUMERIC(14,2) NOT NULL,
-            total_interest_rate NUMERIC(8,4) NOT NULL DEFAULT 0,
-            installments_count INTEGER NOT NULL DEFAULT 1,
+            principal NUMERIC(14,2) NOT NULL DEFAULT 0,
+            interest_rate NUMERIC(8,4) NOT NULL DEFAULT 0,
+            total_due NUMERIC(14,2) NOT NULL DEFAULT 0,
+            duration_months INTEGER NOT NULL DEFAULT 1,
             first_due_date DATE NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Actif',
             note TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
@@ -502,13 +450,19 @@ def create_supabase_schema():
         CREATE TABLE IF NOT EXISTS public.loan_installments (
             id BIGSERIAL PRIMARY KEY,
             loan_id BIGINT NOT NULL REFERENCES public.loans(id) ON DELETE CASCADE,
-            installment_number INTEGER NOT NULL,
+            installment_number INTEGER NOT NULL DEFAULT 1,
             due_date DATE NOT NULL,
-            expected_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
-            paid_date DATE,
-            paid_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+            amount_due NUMERIC(14,2) NOT NULL DEFAULT 0,
+            amount_paid NUMERIC(14,2) NOT NULL DEFAULT 0,
+            payment_date DATE,
             note TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS public.app_migrations (
+            key TEXT PRIMARY KEY,
+            completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """,
         """
@@ -525,23 +479,13 @@ def create_supabase_schema():
         """,
     ]
 
+    # Création initiale.
     with db() as con:
         cur = con.cursor()
         for statement in statements:
             cur.execute(statement)
 
-        # Administrateur initial.
-        cur.execute(
-            """
-            INSERT INTO public.admins (username, password, full_name)
-            VALUES (?, ?, ?)
-            ON CONFLICT (username) DO NOTHING
-            """,
-            (ADMIN_USERNAME, ADMIN_PASSWORD, ADMIN_NAME),
-        )
-
-        # Migration douce : ajoute les colonnes qui pourraient manquer
-        # si les tables existaient déjà dans une ancienne version.
+        # Mise à niveau si une ancienne version des tables existe déjà.
         alter_statements = [
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS phone TEXT",
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS monthly_target NUMERIC(14,2) DEFAULT 0",
@@ -550,44 +494,329 @@ def create_supabase_schema():
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
 
             "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS payment_date DATE",
-            "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS month_label TEXT",
+            "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS amount NUMERIC(14,2) DEFAULT 0",
+            "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS month_label TEXT DEFAULT ''",
             "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS note TEXT",
             "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
 
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS loan_date DATE",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS principal NUMERIC(14,2) DEFAULT 0",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS interest_rate NUMERIC(8,4) DEFAULT 0",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS total_due NUMERIC(14,2) DEFAULT 0",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS duration_months INTEGER DEFAULT 1",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS first_due_date DATE",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'Actif'",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS note TEXT",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS total_interest_rate NUMERIC(8,4) DEFAULT 0",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS installments_count INTEGER DEFAULT 1",
-            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS first_due_date DATE",
-            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS note TEXT",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
 
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS installment_number INTEGER DEFAULT 1",
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS due_date DATE",
+            "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS amount_due NUMERIC(14,2) DEFAULT 0",
+            "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS amount_paid NUMERIC(14,2) DEFAULT 0",
+            "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS payment_date DATE",
+            "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS note TEXT",
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS expected_amount NUMERIC(14,2) DEFAULT 0",
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS paid_date DATE",
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(14,2) DEFAULT 0",
-            "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS note TEXT",
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
         ]
 
         for statement in alter_statements:
+            cur.execute(statement)
+
+        # Compatibilité avec une ancienne version qui utilisait
+        # total_interest_rate/installments_count/expected_amount/paid_date/paid_amount.
+        compatibility = [
+            """
+            UPDATE public.loans
+            SET interest_rate = COALESCE(interest_rate, total_interest_rate, 0)
+            WHERE interest_rate IS NULL
+            """,
+            """
+            UPDATE public.loans
+            SET duration_months = COALESCE(duration_months, installments_count, 1)
+            WHERE duration_months IS NULL
+            """,
+            """
+            UPDATE public.loans
+            SET total_due = COALESCE(
+                total_due,
+                principal * (1 + COALESCE(interest_rate, 0) / 100)
+            )
+            WHERE total_due IS NULL OR total_due = 0
+            """,
+            """
+            UPDATE public.loan_installments
+            SET amount_due = COALESCE(amount_due, expected_amount, 0)
+            WHERE amount_due IS NULL OR amount_due = 0
+            """,
+            """
+            UPDATE public.loan_installments
+            SET amount_paid = COALESCE(amount_paid, paid_amount, 0)
+            WHERE amount_paid IS NULL OR amount_paid = 0
+            """,
+            """
+            UPDATE public.loan_installments
+            SET payment_date = paid_date
+            WHERE payment_date IS NULL AND paid_date IS NOT NULL
+            """,
+        ]
+        for statement in compatibility:
             try:
                 cur.execute(statement)
             except Exception:
-                # Une colonne peut être incompatible avec une ancienne structure.
-                # Les tables principales ont déjà été créées avec le bon schéma.
+                # Certaines colonnes anciennes peuvent ne pas exister.
+                # La structure actuelle reste prioritaire.
                 con.rollback()
                 cur = con.cursor()
+
+        # Administrateur initial.
+        cur.execute(
+            """
+            INSERT INTO public.admins (username, password, full_name)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (username) DO NOTHING
+            """,
+            (ADMIN_USERNAME, ADMIN_PASSWORD, ADMIN_NAME),
+        )
 
         cur.close()
 
 
+def auto_migrate_sqlite_to_supabase():
+    """Importe l'ancienne base SQLite vers Supabase sans doublonner les données."""
+    if not use_supabase() or not DB_PATH.exists():
+        return
 
-def database_status():
-    if use_supabase():
-        return "Supabase PostgreSQL"
-    return "SQLite local (secours)"
+    s = sqlite3.connect(DB_PATH)
+    s.row_factory = sqlite3.Row
 
+    try:
+        with db() as pg:
+            cur = pg.cursor()
+
+            cur.execute(
+                "SELECT 1 FROM public.app_migrations WHERE key=%s",
+                ("sqlite_to_supabase_v2",),
+            )
+            if cur.fetchone():
+                cur.close()
+                return
+
+            member_map = {}
+
+            if sqlite_table_exists(s, "members"):
+                for m in s.execute("SELECT * FROM members ORDER BY id").fetchall():
+                    cur.execute(
+                        """
+                        SELECT id FROM public.members
+                        WHERE full_name=%s
+                          AND COALESCE(phone,'')=COALESCE(%s,'')
+                        LIMIT 1
+                        """,
+                        (
+                            m["full_name"],
+                            m["phone"] if "phone" in m.keys() else None,
+                        ),
+                    )
+                    found = cur.fetchone()
+
+                    if found:
+                        member_map[m["id"]] = found["id"] if isinstance(found, dict) else found[0]
+                    else:
+                        cur.execute(
+                            """
+                            INSERT INTO public.members
+                            (full_name, phone, monthly_target, notes, active)
+                            VALUES (%s, %s, %s, %s, %s)
+                            RETURNING id
+                            """,
+                            (
+                                m["full_name"],
+                                m["phone"] if "phone" in m.keys() else None,
+                                m["monthly_target"] if "monthly_target" in m.keys() else 0,
+                                m["notes"] if "notes" in m.keys() else None,
+                                bool(m["active"]) if "active" in m.keys() else True,
+                            ),
+                        )
+                        row = cur.fetchone()
+                        member_map[m["id"]] = row["id"] if isinstance(row, dict) else row[0]
+
+            if sqlite_table_exists(s, "contributions"):
+                for c in s.execute("SELECT * FROM contributions ORDER BY id").fetchall():
+                    mid = member_map.get(c["member_id"])
+                    if not mid:
+                        continue
+
+                    cur.execute(
+                        """
+                        SELECT 1 FROM public.contributions
+                        WHERE member_id=%s AND payment_date=%s AND amount=%s
+                        LIMIT 1
+                        """,
+                        (mid, c["payment_date"], c["amount"]),
+                    )
+
+                    if not cur.fetchone():
+                        cur.execute(
+                            """
+                            INSERT INTO public.contributions
+                            (member_id, payment_date, amount, month_label, note)
+                            VALUES (%s, %s, %s, %s, %s)
+                            """,
+                            (
+                                mid,
+                                c["payment_date"],
+                                c["amount"],
+                                c["month_label"] if "month_label" in c.keys() else "",
+                                c["note"] if "note" in c.keys() else None,
+                            ),
+                        )
+
+            loan_map = {}
+
+            if sqlite_table_exists(s, "loans"):
+                for l in s.execute("SELECT * FROM loans ORDER BY id").fetchall():
+                    mid = member_map.get(l["member_id"])
+                    if not mid:
+                        continue
+
+                    principal = float(l["principal"] or 0)
+                    rate = float(
+                        l["interest_rate"]
+                        if "interest_rate" in l.keys()
+                        else l["total_interest_rate"]
+                        if "total_interest_rate" in l.keys()
+                        else 0
+                    )
+                    duration = int(
+                        l["duration_months"]
+                        if "duration_months" in l.keys()
+                        else l["installments_count"]
+                        if "installments_count" in l.keys()
+                        else 1
+                    )
+                    total_due = float(
+                        l["total_due"]
+                        if "total_due" in l.keys() and l["total_due"] is not None
+                        else principal * (1 + rate / 100)
+                    )
+                    status = (
+                        l["status"] if "status" in l.keys() and l["status"]
+                        else "Actif"
+                    )
+
+                    cur.execute(
+                        """
+                        SELECT id FROM public.loans
+                        WHERE member_id=%s AND loan_date=%s AND principal=%s
+                        LIMIT 1
+                        """,
+                        (mid, l["loan_date"], principal),
+                    )
+                    found = cur.fetchone()
+
+                    if found:
+                        loan_map[l["id"]] = found["id"] if isinstance(found, dict) else found[0]
+                    else:
+                        cur.execute(
+                            """
+                            INSERT INTO public.loans
+                            (member_id, loan_date, principal, interest_rate,
+                             total_due, duration_months, first_due_date, status, note)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            RETURNING id
+                            """,
+                            (
+                                mid,
+                                l["loan_date"],
+                                principal,
+                                rate,
+                                total_due,
+                                duration,
+                                l["first_due_date"],
+                                status,
+                                l["note"] if "note" in l.keys() else None,
+                            ),
+                        )
+                        row = cur.fetchone()
+                        loan_map[l["id"]] = row["id"] if isinstance(row, dict) else row[0]
+
+            if sqlite_table_exists(s, "loan_installments"):
+                for i in s.execute("SELECT * FROM loan_installments ORDER BY id").fetchall():
+                    lid = loan_map.get(i["loan_id"])
+                    if not lid:
+                        continue
+
+                    due = i["due_date"]
+                    number = int(
+                        i["installment_number"]
+                        if "installment_number" in i.keys()
+                        else 1
+                    )
+                    amount_due = float(
+                        i["amount_due"]
+                        if "amount_due" in i.keys()
+                        else i["expected_amount"]
+                        if "expected_amount" in i.keys()
+                        else 0
+                    )
+                    amount_paid = float(
+                        i["amount_paid"]
+                        if "amount_paid" in i.keys()
+                        else i["paid_amount"]
+                        if "paid_amount" in i.keys()
+                        else 0
+                    )
+                    payment_date = (
+                        i["payment_date"]
+                        if "payment_date" in i.keys()
+                        else i["paid_date"]
+                        if "paid_date" in i.keys()
+                        else None
+                    )
+
+                    cur.execute(
+                        """
+                        SELECT 1 FROM public.loan_installments
+                        WHERE loan_id=%s AND installment_number=%s
+                        LIMIT 1
+                        """,
+                        (lid, number),
+                    )
+
+                    if not cur.fetchone():
+                        cur.execute(
+                            """
+                            INSERT INTO public.loan_installments
+                            (loan_id, installment_number, due_date, amount_due,
+                             amount_paid, payment_date, note)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                lid,
+                                number,
+                                due,
+                                amount_due,
+                                amount_paid,
+                                payment_date,
+                                i["note"] if "note" in i.keys() else None,
+                            ),
+                        )
+
+            cur.execute(
+                """
+                INSERT INTO public.app_migrations(key)
+                VALUES (%s)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                ("sqlite_to_supabase_v2",),
+            )
+            cur.close()
+    finally:
+        s.close()
 
 
 def sqlite_table_exists(con, table_name):
@@ -597,128 +826,10 @@ def sqlite_table_exists(con, table_name):
     ).fetchone() is not None
 
 
-def auto_migrate_sqlite_to_supabase():
-    """Importe automatiquement l'ancienne SQLite vers Supabase une seule fois."""
-    if not use_supabase() or not DB_PATH.exists():
-        return
-
-    with db() as con:
-        cur=con.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS public.app_migrations (
-                key TEXT PRIMARY KEY,
-                completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-        cur.execute("SELECT 1 FROM public.app_migrations WHERE key=?",
-                    ("sqlite_to_supabase_v1",))
-        if cur.fetchone():
-            cur.close()
-            return
-
-    s=sqlite3.connect(DB_PATH)
-    s.row_factory=sqlite3.Row
-    try:
-        with db() as pg:
-            cur=pg.cursor()
-            member_map={}
-            if sqlite_table_exists(s,"members"):
-                for m in s.execute("SELECT * FROM members ORDER BY id").fetchall():
-                    cur.execute("""
-                        SELECT id FROM public.members
-                        WHERE full_name=? AND COALESCE(phone,'')=COALESCE(?,'')
-                        LIMIT 1
-                    """,(m["full_name"],m["phone"] if "phone" in m.keys() else None))
-                    found=cur.fetchone()
-                    if found:
-                        member_map[m["id"]]=found[0]
-                    else:
-                        cur.execute("""
-                            INSERT INTO public.members
-                            (full_name,phone,monthly_target,notes,active)
-                            VALUES (?,?,?,?,?) RETURNING id
-                        """,(
-                            m["full_name"],
-                            m["phone"] if "phone" in m.keys() else None,
-                            m["monthly_target"] if "monthly_target" in m.keys() else 0,
-                            m["notes"] if "notes" in m.keys() else None,
-                            bool(m["active"]) if "active" in m.keys() else True,
-                        ))
-                        member_map[m["id"]]=cur.fetchone()[0]
-
-            if sqlite_table_exists(s,"contributions"):
-                for c in s.execute("SELECT * FROM contributions ORDER BY id").fetchall():
-                    mid=member_map.get(c["member_id"])
-                    if not mid: continue
-                    cur.execute("""
-                        SELECT 1 FROM public.contributions
-                        WHERE member_id=? AND payment_date=? AND amount=?
-                        LIMIT 1
-                    """,(mid,c["payment_date"],c["amount"]))
-                    if not cur.fetchone():
-                        cur.execute("""
-                            INSERT INTO public.contributions
-                            (member_id,payment_date,month_label,amount,note)
-                            VALUES (?,?,?,?,?)
-                        """,(
-                            mid,c["payment_date"],c["month_label"],c["amount"],
-                            c["note"] if "note" in c.keys() else None,
-                        ))
-
-            loan_map={}
-            if sqlite_table_exists(s,"loans"):
-                for l in s.execute("SELECT * FROM loans ORDER BY id").fetchall():
-                    mid=member_map.get(l["member_id"])
-                    if not mid: continue
-                    cur.execute("""
-                        SELECT id FROM public.loans
-                        WHERE member_id=? AND loan_date=? AND principal=?
-                        LIMIT 1
-                    """,(mid,l["loan_date"],l["principal"]))
-                    found=cur.fetchone()
-                    if found:
-                        loan_map[l["id"]]=found[0]
-                    else:
-                        cur.execute("""
-                            INSERT INTO public.loans
-                            (member_id,loan_date,principal,total_interest_rate,
-                             installments_count,first_due_date,note)
-                            VALUES (?,?,?,?,?,?,?) RETURNING id
-                        """,(
-                            mid,l["loan_date"],l["principal"],
-                            l["total_interest_rate"],l["installments_count"],
-                            l["first_due_date"],l["note"] if "note" in l.keys() else None,
-                        ))
-                        loan_map[l["id"]]=cur.fetchone()[0]
-
-            if sqlite_table_exists(s,"loan_installments"):
-                for i in s.execute("SELECT * FROM loan_installments ORDER BY id").fetchall():
-                    lid=loan_map.get(i["loan_id"])
-                    if not lid: continue
-                    cur.execute("""
-                        SELECT 1 FROM public.loan_installments
-                        WHERE loan_id=? AND installment_number=? LIMIT 1
-                    """,(lid,i["installment_number"]))
-                    if not cur.fetchone():
-                        cur.execute("""
-                            INSERT INTO public.loan_installments
-                            (loan_id,installment_number,due_date,expected_amount,
-                             paid_date,paid_amount,note)
-                            VALUES (?,?,?,?,?,?,?)
-                        """,(
-                            lid,i["installment_number"],i["due_date"],
-                            i["expected_amount"],i["paid_date"],i["paid_amount"],
-                            i["note"] if "note" in i.keys() else None,
-                        ))
-
-            cur.execute("""
-                INSERT INTO public.app_migrations(key)
-                VALUES (?)
-                ON CONFLICT(key) DO NOTHING
-            """,("sqlite_to_supabase_v1",))
-            cur.close()
-    finally:
-        s.close()
+def migrate_database(con):
+    """Migration de l'ancien schéma SQLite."""
+    # Le schéma SQLite historique reste géré séparément.
+    return
 
 
 def init_db():
@@ -728,7 +839,13 @@ def init_db():
             auto_migrate_sqlite_to_supabase()
         except Exception as exc:
             st.error("Erreur de connexion ou de préparation Supabase.")
-            st.code(str(exc))
+            st.code(
+                "Détail technique :\n"
+                + str(exc)
+                + "\n\n"
+                "Vérifiez notamment SUPABASE_DB_URL, psycopg2-binary "
+                "et les droits PostgreSQL du compte utilisé."
+            )
             st.stop()
         return
 
@@ -769,9 +886,11 @@ def init_db():
                 member_id INTEGER NOT NULL,
                 loan_date TEXT NOT NULL,
                 principal REAL NOT NULL,
-                total_interest_rate REAL NOT NULL DEFAULT 0,
-                installments_count INTEGER NOT NULL DEFAULT 1,
+                interest_rate REAL NOT NULL DEFAULT 0,
+                total_due REAL NOT NULL DEFAULT 0,
+                duration_months INTEGER NOT NULL DEFAULT 1,
                 first_due_date TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Actif',
                 note TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
@@ -779,17 +898,17 @@ def init_db():
             CREATE TABLE IF NOT EXISTS loan_installments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 loan_id INTEGER NOT NULL,
-                installment_number INTEGER NOT NULL,
+                installment_number INTEGER NOT NULL DEFAULT 1,
                 due_date TEXT NOT NULL,
-                expected_amount REAL NOT NULL DEFAULT 0,
-                paid_date TEXT,
-                paid_amount REAL NOT NULL DEFAULT 0,
+                amount_due REAL NOT NULL DEFAULT 0,
+                amount_paid REAL NOT NULL DEFAULT 0,
+                payment_date TEXT,
                 note TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
-        migrate_database(con)
+
         con.execute(
             """
             INSERT OR IGNORE INTO admins (username, password, full_name)
@@ -797,8 +916,6 @@ def init_db():
             """,
             (ADMIN_USERNAME, ADMIN_PASSWORD, ADMIN_NAME),
         )
-
-
 
 def money(value):
     try:
