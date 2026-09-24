@@ -53,6 +53,15 @@ TWILIO_WHATSAPP_FROM = secret_or_env(
     "whatsapp:+221777521969"
 )
 
+# Configuration Supabase / PostgreSQL.
+# On lit d'abord .streamlit/secrets.toml, puis les variables d'environnement.
+SUPABASE_DB_URL = secret_or_env("SUPABASE_DB_URL", "")
+SUPABASE_HOST = secret_or_env("SUPABASE_HOST", "")
+SUPABASE_PORT = secret_or_env("SUPABASE_PORT", "5432")
+SUPABASE_DATABASE = secret_or_env("SUPABASE_DATABASE", "postgres")
+SUPABASE_USER = secret_or_env("SUPABASE_USER", "")
+SUPABASE_PASSWORD = secret_or_env("SUPABASE_PASSWORD", "")
+
 # Visuel de marque fourni pour l'application et les bulletins PDF.
 ASSET_IMAGE = Path(__file__).with_name("pe.jpeg")
 
@@ -319,7 +328,16 @@ def postgres_dsn():
 
 
 def use_supabase():
-    return bool(SUPABASE_DB_URL or SUPABASE_HOST) and psycopg2 is not None
+    """Indique si une connexion Supabase/PostgreSQL peut être utilisée."""
+    configured = bool(
+        SUPABASE_DB_URL
+        or (
+            SUPABASE_HOST
+            and SUPABASE_USER
+            and SUPABASE_PASSWORD
+        )
+    )
+    return configured and psycopg2 is not None
 
 
 @contextmanager
