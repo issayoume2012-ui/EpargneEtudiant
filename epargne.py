@@ -89,7 +89,7 @@ SUPABASE_SSLMODE = postgres_secret("sslmode", "require") or "require"
 SUPABASE_CONNECT_TIMEOUT = int(postgres_secret("connect_timeout", "10") or 10)
 
 # Visuel de marque fourni pour l'application et les bulletins PDF.
-ASSET_IMAGE = Path(__file__).with_name("pe.jpeg")
+ASSET_IMAGE = Path(__file__).with_name("peo.png")
 
 BRAND_NAVY = "#122A55"
 BRAND_BLUE = "#A9D4F5"
@@ -728,6 +728,32 @@ def migrate_database(con):
             "paid_date": "TEXT",
             "paid_amount": "REAL DEFAULT 0",
         },
+        "loan_votes": {
+            "loan_id": "INTEGER",
+            "voter_member_id": "INTEGER",
+            "decision": "TEXT DEFAULT 'En attente'",
+            "comment": "TEXT",
+            "created_at": "TEXT",
+        },
+        "member_messages": {
+            "member_id": "INTEGER",
+            "sender_role": "TEXT DEFAULT 'member'",
+            "sender_member_id": "INTEGER",
+            "subject": "TEXT",
+            "message": "TEXT",
+            "message_type": "TEXT DEFAULT 'message'",
+            "is_read": "INTEGER DEFAULT 0",
+            "created_at": "TEXT",
+        },
+        "member_reminders": {
+            "member_id": "INTEGER",
+            "reminder_type": "TEXT",
+            "title": "TEXT",
+            "message": "TEXT",
+            "due_date": "TEXT",
+            "whatsapp_sent": "INTEGER DEFAULT 0",
+            "created_at": "TEXT",
+        },
     }
 
     for table, fields in specs.items():
@@ -842,6 +868,42 @@ def create_supabase_schema():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS public.loan_votes (
+                id BIGSERIAL PRIMARY KEY,
+                loan_id BIGINT NOT NULL REFERENCES public.loans(id) ON DELETE CASCADE,
+                voter_member_id BIGINT NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
+                decision TEXT NOT NULL DEFAULT 'En attente',
+                comment TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(loan_id, voter_member_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS public.member_messages (
+                id BIGSERIAL PRIMARY KEY,
+                member_id BIGINT NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
+                sender_role TEXT NOT NULL DEFAULT 'member',
+                sender_member_id BIGINT REFERENCES public.members(id) ON DELETE SET NULL,
+                subject TEXT,
+                message TEXT NOT NULL,
+                message_type TEXT NOT NULL DEFAULT 'message',
+                is_read BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS public.member_reminders (
+                id BIGSERIAL PRIMARY KEY,
+                member_id BIGINT NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
+                reminder_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                due_date DATE,
+                whatsapp_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
         ]
 
         for statement in table_statements:
@@ -947,6 +1009,18 @@ def create_supabase_schema():
             """
             CREATE INDEX IF NOT EXISTS idx_installments_loan_due
             ON public.loan_installments(loan_id, due_date)
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_loan_votes_unique
+            ON public.loan_votes(loan_id, voter_member_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_member_messages_member_created
+            ON public.member_messages(member_id, created_at DESC)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_member_reminders_member_created
+            ON public.member_reminders(member_id, created_at DESC)
             """,
         ]
 
@@ -1382,21 +1456,101 @@ def member_account_page(member_id):
         st.error("Compte membre introuvable.")
         return
     name = str(data["member"].iloc[0]["full_name"])
-    brand_hero("Mon compte", f"Bienvenue {name}. Cette page est personnelle et en lecture seule.", compact=True)
+    brand_hero("Mon espace membre", f"Bienvenue {name}. Retrouvez vos opérations, vos rappels et participez aux validations.", compact=True)
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total cotisé", money(data["total_contributed"]))
     c2.metric("Total emprunté", money(data["total_borrowed"]))
     c3.metric("Remboursements reçus", money(data["total_received"]))
     c4.metric("Reste à payer", money(data["outstanding"]))
 
-    st.info("🔒 Vous ne pouvez consulter que vos propres cotisations, emprunts et échéances. Aucune modification n'est autorisée depuis cet espace.")
-    t1, t2, t3 = st.tabs(["💰 Mes cotisations", "💳 Mes emprunts", "📅 Mes échéances"])
-    with t1:
+    reminders = get_member_reminders(member_id)
+    messages = get_member_messages(member_id)
+    votes = loan_votes_for_member(member_id)
+
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "💰 Mes cotisations", "💳 Mes emprunts", "📅 Mes échéances",
+        "🔔 Mes rappels", "💬 Messages & réclamations", "🗳️ Votes / droit de veto"
+    ])
+    with tab1:
         st.dataframe(data["contributions"], use_container_width=True, hide_index=True)
-    with t2:
+    with tab2:
         st.dataframe(data["loans"], use_container_width=True, hide_index=True)
-    with t3:
+    with tab3:
         st.dataframe(data["installments"], use_container_width=True, hide_index=True)
+
+    with tab4:
+        if reminders.empty:
+            st.info("Aucun rappel pour le moment.")
+        else:
+            for _, r in reminders.iterrows():
+                with st.container(border=True):
+                    st.markdown(f"**{r['title']}**")
+                    if pd.notna(r.get("due_date")) and str(r.get("due_date")):
+                        st.caption(f"Échéance : {r['due_date']}")
+                    st.write(str(r["message"]))
+                    if bool(r.get("whatsapp_sent")):
+                        st.caption("📱 Rappel également envoyé sur WhatsApp.")
+
+    with tab5:
+        st.subheader("✉️ Écrire à l'administration")
+        with st.form("member_message_form"):
+            subject = st.text_input("Objet", placeholder="Question, remarque, demande...")
+            msg_type = st.selectbox("Type", ["Message", "Réclamation"])
+            message = st.text_area("Votre message", height=150)
+            send = st.form_submit_button("📨 Envoyer")
+            if send:
+                try:
+                    send_member_message_to_admin(
+                        member_id, subject, message,
+                        "reclamation" if msg_type == "Réclamation" else "message"
+                    )
+                    st.success("Votre message a été transmis à l'administration.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+        st.divider()
+        st.subheader("📥 Échanges avec l'administration")
+        if messages.empty:
+            st.info("Aucun échange.")
+        else:
+            for _, r in messages.iterrows():
+                sender = "👨‍💼 Administration" if r["sender_role"] == "admin" else "👤 Vous"
+                label = "Réclamation" if r["message_type"] == "reclamation" else "Message"
+                st.markdown(f"**{sender} — {label} — {r['subject'] or 'Sans objet'}**")
+                st.write(str(r["message"]))
+                st.caption(str(r["created_at"]))
+                if not bool(r["is_read"]):
+                    mark_message_read(r["id"])
+
+    with tab6:
+        st.info("Chaque membre actif, sauf le bénéficiaire, dispose d'un vote sur les nouveaux prêts. Un veto bloque la confirmation du prêt.")
+        if votes.empty:
+            st.success("Aucun prêt d'un autre membre ne vous attend actuellement.")
+        else:
+            for _, r in votes.iterrows():
+                with st.container(border=True):
+                    st.markdown(f"**Prêt #{int(r['loan_id'])} — {r['borrower_name']} — {money(r['principal'])}**")
+                    st.caption(f"Date : {r['loan_date']} · Statut : {r['status']}")
+                    current = str(r["decision"])
+                    if current == "En attente":
+                        with st.form(f"vote_form_{int(r['loan_id'])}"):
+                            decision = st.radio("Votre décision", ["Approuvé", "Veto"], horizontal=True)
+                            comment = st.text_area("Commentaire (facultatif)", height=90)
+                            vote_btn = st.form_submit_button("Valider mon vote", type="primary")
+                            if vote_btn:
+                                try:
+                                    new_status = cast_loan_vote(int(r["loan_id"]), member_id, decision, comment)
+                                    st.success(f"Vote enregistré. Statut du prêt : {new_status}.")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(str(exc))
+                    else:
+                        icon = "🛑" if current == "Veto" else "✅"
+                        st.write(f"{icon} Votre vote : **{current}**")
+                        if r.get("comment"):
+                            st.caption(f"Commentaire : {r['comment']}")
 
 
 # ============================================================
@@ -1826,6 +1980,11 @@ def create_loan(
         verify = con.execute(f"SELECT id FROM {loan_table} WHERE id=? LIMIT 1", (loan_id,)).fetchone()
         if not verify:
             raise RuntimeError('La base n’a pas confirmé le prêt.')
+    ensure_loan_votes(loan_id)
+    _, vote_status = loan_vote_status(loan_id)
+    with db() as con:
+        con.execute(f"UPDATE {loan_table} SET status=? WHERE id=?", (vote_status, loan_id))
+        con.commit()
     refresh_application_data()
     return loan_id
 
@@ -1983,6 +2142,227 @@ def register_installment_payment(
 
         con.commit()
     refresh_application_data()
+
+
+
+# ============================================================
+# COMMUNICATION MEMBRES / VALIDATION DES PRÊTS
+# ============================================================
+
+def _table(name):
+    return f"public.{name}" if use_supabase() else name
+
+
+def create_member_message(member_id, message, subject="", message_type="message",
+                          sender_role="member", sender_member_id=None):
+    member_id = safe_int_id(member_id)
+    if member_id is None or not str(message or "").strip():
+        raise ValueError("Le membre et le message sont obligatoires.")
+    table = _table("member_messages")
+    with db() as con:
+        con.execute(
+            f"""INSERT INTO {table}
+                (member_id, sender_role, sender_member_id, subject, message, message_type, is_read)
+                VALUES (?, ?, ?, ?, ?, ?, FALSE)""",
+            (member_id, sender_role, safe_int_id(sender_member_id),
+             str(subject or "").strip(), str(message).strip(), message_type),
+        )
+        con.commit()
+
+
+def get_member_messages(member_id=None, unread_only=False):
+    table = _table("member_messages")
+    mt = _table("members")
+    query = f"""
+        SELECT mm.id, mm.member_id, m.full_name AS member_name,
+               mm.sender_role, mm.sender_member_id, mm.subject, mm.message,
+               mm.message_type, mm.is_read, mm.created_at
+        FROM {table} mm
+        LEFT JOIN {mt} m ON m.id=mm.sender_member_id
+    """
+    clauses, params = [], []
+    if member_id is not None:
+        clauses.append("mm.member_id=?")
+        params.append(int(member_id))
+    if unread_only:
+        clauses.append("COALESCE(mm.is_read,FALSE)=FALSE")
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY mm.created_at DESC, mm.id DESC"
+    return read_sql(query, params)
+
+
+def mark_message_read(message_id):
+    table = _table("member_messages")
+    with db() as con:
+        con.execute(f"UPDATE {table} SET is_read=TRUE WHERE id=?", (safe_int_id(message_id),))
+        con.commit()
+
+
+def create_member_reminder(member_id, reminder_type, title, message, due_date=None,
+                           whatsapp_sent=False):
+    member_id = safe_int_id(member_id)
+    if member_id is None or not str(message or "").strip():
+        raise ValueError("Le membre et le rappel sont obligatoires.")
+    table = _table("member_reminders")
+    with db() as con:
+        con.execute(
+            f"""INSERT INTO {table}
+                (member_id, reminder_type, title, message, due_date, whatsapp_sent)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+            (member_id, str(reminder_type), str(title), str(message).strip(),
+             due_date.isoformat() if due_date else None, bool(whatsapp_sent)),
+        )
+        con.commit()
+
+
+def get_member_reminders(member_id):
+    table = _table("member_reminders")
+    return read_sql(
+        f"""SELECT id, member_id, reminder_type, title, message, due_date,
+                   whatsapp_sent, created_at
+            FROM {table}
+            WHERE member_id=?
+            ORDER BY created_at DESC, id DESC""",
+        [int(member_id)],
+    )
+
+
+def send_member_message_to_admin(member_id, subject, message, message_type="message"):
+    """Le membre écrit à l'administration; la conversation est visible côté admin."""
+    create_member_message(
+        member_id, message, subject, message_type,
+        sender_role="member", sender_member_id=member_id
+    )
+
+
+def send_admin_message_to_member(member_id, subject, message, message_type="message"):
+    """L'administration répond ou informe un membre."""
+    create_member_message(
+        member_id, message, subject, message_type,
+        sender_role="admin", sender_member_id=None
+    )
+
+
+def ensure_loan_votes(loan_id):
+    """Crée un bulletin pour chaque autre membre actif."""
+    loan_id = safe_int_id(loan_id)
+    if loan_id is None:
+        return
+    lt, mt, vt = _table("loans"), _table("members"), _table("loan_votes")
+    with db() as con:
+        loan = con.execute(f"SELECT member_id FROM {lt} WHERE id=?", (loan_id,)).fetchone()
+        if not loan:
+            return
+        borrower_id = safe_int_id(loan["member_id"])
+        members = con.execute(
+            f"SELECT id FROM {mt} WHERE active=TRUE AND id<>?", (borrower_id,)
+        ).fetchall()
+        for row in members:
+            if use_supabase():
+                con.execute(
+                    f"""INSERT INTO {vt}(loan_id, voter_member_id, decision)
+                        VALUES (?, ?, 'En attente')
+                        ON CONFLICT (loan_id, voter_member_id) DO NOTHING""",
+                    (loan_id, safe_int_id(row["id"])),
+                )
+            else:
+                con.execute(
+                    f"""INSERT OR IGNORE INTO {vt}(loan_id, voter_member_id, decision)
+                        VALUES (?, ?, 'En attente')""",
+                    (loan_id, safe_int_id(row["id"])),
+                )
+        con.commit()
+
+
+def loan_vote_status(loan_id):
+    """Un seul veto bloque; le prêt est confirmé lorsque tous les autres membres ont voté oui."""
+    ensure_loan_votes(loan_id)
+    vt, mt = _table("loan_votes"), _table("members")
+    with db() as con:
+        rows = con.execute(
+            f"""SELECT lv.id, lv.loan_id, lv.voter_member_id, m.full_name AS voter_name,
+                       lv.decision, lv.comment, lv.created_at
+                FROM {vt} lv
+                LEFT JOIN {mt} m ON m.id=lv.voter_member_id
+                WHERE lv.loan_id=?
+                ORDER BY m.full_name, lv.id""",
+            (safe_int_id(loan_id),),
+        ).fetchall()
+    df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame(
+        columns=["id","loan_id","voter_member_id","voter_name","decision","comment","created_at"]
+    )
+    total = len(df)
+    vetoes = int((df["decision"] == "Veto").sum()) if not df.empty else 0
+    approvals = int((df["decision"] == "Approuvé").sum()) if not df.empty else 0
+    pending = int((df["decision"] == "En attente").sum()) if not df.empty else 0
+    if vetoes:
+        status = "Bloqué par un veto"
+    elif total == 0 or (approvals == total and pending == 0):
+        status = "Confirmé"
+    else:
+        status = "En attente de validation"
+    return df, status
+
+
+def cast_loan_vote(loan_id, voter_member_id, decision, comment=""):
+    loan_id = safe_int_id(loan_id)
+    voter_member_id = safe_int_id(voter_member_id)
+    decision = str(decision or "").strip()
+    if decision not in {"Approuvé", "Veto"}:
+        raise ValueError("Décision invalide.")
+    if loan_id is None or voter_member_id is None:
+        raise ValueError("Prêt ou membre invalide.")
+    lt, mt, vt = _table("loans"), _table("members"), _table("loan_votes")
+    with db() as con:
+        loan = con.execute(f"SELECT member_id FROM {lt} WHERE id=?", (loan_id,)).fetchone()
+        if not loan:
+            raise ValueError("Prêt introuvable.")
+        if safe_int_id(loan["member_id"]) == voter_member_id:
+            raise ValueError("Le bénéficiaire du prêt ne peut pas voter sur son propre prêt.")
+        voter = con.execute(
+            f"SELECT id FROM {mt} WHERE id=? AND active=TRUE", (voter_member_id,)
+        ).fetchone()
+        if not voter:
+            raise ValueError("Membre votant introuvable ou inactif.")
+        if use_supabase():
+            con.execute(
+                f"""INSERT INTO {vt}(loan_id, voter_member_id, decision, comment)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT (loan_id, voter_member_id)
+                    DO UPDATE SET decision=EXCLUDED.decision, comment=EXCLUDED.comment,
+                                  created_at=NOW()""",
+                (loan_id, voter_member_id, decision, str(comment or "").strip()),
+            )
+        else:
+            con.execute(
+                f"""INSERT OR REPLACE INTO {vt}
+                    (loan_id, voter_member_id, decision, comment, created_at)
+                    VALUES (?, ?, ?, ?, datetime('now'))""",
+                (loan_id, voter_member_id, decision, str(comment or "").strip()),
+            )
+        con.commit()
+    _, status = loan_vote_status(loan_id)
+    with db() as con:
+        con.execute(f"UPDATE {lt} SET status=? WHERE id=?", (status, loan_id))
+        con.commit()
+    refresh_application_data()
+    return status
+
+
+def loan_votes_for_member(member_id):
+    lt, vt, mt = _table("loans"), _table("loan_votes"), _table("members")
+    return read_sql(
+        f"""SELECT l.id AS loan_id, l.member_id AS borrower_id,
+                   borrower.full_name AS borrower_name, l.loan_date, l.principal,
+                   l.status, lv.decision, lv.comment, lv.created_at
+            FROM {lt} l
+            JOIN {vt} lv ON lv.loan_id=l.id
+            JOIN {mt} borrower ON borrower.id=l.member_id
+            WHERE lv.voter_member_id=? AND l.member_id<>?
+            ORDER BY l.loan_date DESC, l.id DESC""",
+        [int(member_id), int(member_id)],
+    )
 
 
 # ============================================================
@@ -2528,6 +2908,8 @@ def generate_member_pdf(member_id):
     return buffer.getvalue()
 
 
+
+
 # ============================================================
 # RAPPORT GLOBAL PDF + EXCEL
 # ============================================================
@@ -2879,6 +3261,14 @@ except Exception as _db_exc:
     st.info("Vérifiez les secrets [postgres] et le paquet psycopg2-binary dans requirements.txt, puis redémarrez l'application.")
     st.stop()
 
+# Les prêts déjà présents reçoivent également leur bulletin de vote.
+try:
+    existing_loans = loans()
+    for _lid in existing_loans["id"].tolist() if not existing_loans.empty else []:
+        ensure_loan_votes(_lid)
+except Exception:
+    pass
+
 if "user" not in st.session_state:
     st.session_state.user = None
 
@@ -3109,6 +3499,7 @@ else:
         "Cotisations",
         "Emprunts",
         "Rappels WhatsApp",
+        "Communication",
         "Rapport global",
         "Bulletins PDF",
         "Administrateurs",
@@ -3393,7 +3784,7 @@ elif page == "Emprunts":
             if submit:
                 try:
                     create_loan(member_id, loan_date, principal, rate, duration, first_due_date, note)
-                    st.success("Prêt enregistré avec ses échéances.")
+                    st.success("Prêt enregistré. Il est maintenant soumis aux votes des autres membres actifs.")
                     st.rerun()
                 except Exception as exc:
                     st.error(str(exc))
@@ -3402,6 +3793,25 @@ elif page == "Emprunts":
         ldf = loans()
         st.subheader("📋 Historique des emprunts")
         st.dataframe(ldf, use_container_width=True, hide_index=True)
+
+        if not ldf.empty:
+            st.subheader("🗳️ État des validations / vetos")
+            vote_rows = []
+            for _, loan in ldf.iterrows():
+                lid = safe_int_id(loan.get("id"))
+                if lid is None:
+                    continue
+                vdf, vstatus = loan_vote_status(lid)
+                vote_rows.append({
+                    "Prêt": lid,
+                    "Bénéficiaire": loan.get("full_name", ""),
+                    "Montant": money(loan.get("principal", 0)),
+                    "Statut": vstatus,
+                    "Approuvés": int((vdf["decision"] == "Approuvé").sum()) if not vdf.empty else 0,
+                    "Vetos": int((vdf["decision"] == "Veto").sum()) if not vdf.empty else 0,
+                    "En attente": int((vdf["decision"] == "En attente").sum()) if not vdf.empty else 0,
+                })
+            st.dataframe(pd.DataFrame(vote_rows), use_container_width=True, hide_index=True)
 
         if not ldf.empty:
             loan_options = {f"#{safe_int_id(r['id'])} — {r['full_name']} — {money(r['principal'])}": safe_int_id(r['id']) for _,r in ldf.iterrows() if safe_int_id(r.get('id')) is not None}
@@ -3478,17 +3888,28 @@ elif page == "Emprunts":
 # ============================================================
 
 elif page == "Rappels WhatsApp":
-    brand_hero("Rappels WhatsApp", "Préparez des rappels de cotisation, de remboursement ou des remarques personnalisées.", compact=True)
+    brand_hero("Rappels WhatsApp & espace membre", "Envoyez les rappels sur WhatsApp et déposez automatiquement une copie dans l'espace membre.", compact=True)
     st.info(f"Numéro administratif configuré : +{WHATSAPP}")
 
     st.subheader("📅 Rappel mensuel des cotisations")
     if date.today().day == 8:
         st.success("Nous sommes le 8 : journée prévue pour les rappels mensuels.")
-    if st.button("📨 Envoyer les rappels mensuels maintenant"):
-        try:
-            st.dataframe(send_monthly_reminders(), use_container_width=True, hide_index=True)
-        except Exception as exc:
-            st.error(str(exc))
+    if st.button("📨 Envoyer les rappels mensuels WhatsApp + espace membre"):
+        mdf = get_members(True)
+        results = []
+        for _, row in mdf.iterrows():
+            msg = contribution_message(row["full_name"])
+            wa_status = "Non envoyé"
+            try:
+                send_whatsapp(row["phone"], msg)
+                wa_status = "Envoyé"
+                wa_sent = True
+            except Exception as exc:
+                wa_sent = False
+                wa_status = f"Erreur : {exc}"
+            create_member_reminder(row["id"], "cotisation", "Rappel de cotisation", msg, date.today(), wa_sent)
+            results.append({"Membre": row["full_name"], "WhatsApp": wa_status, "Espace membre": "Ajouté"})
+        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
 
     st.divider()
     mdf = get_members(True)
@@ -3502,7 +3923,19 @@ elif page == "Rappels WhatsApp":
         with tab_c:
             msg = contribution_message(member_row['full_name'])
             st.text_area("Message prérempli", value=msg, height=170, key="contribution_reminder_msg")
-            st.link_button("💬 Ouvrir WhatsApp", whatsapp_link(member_row['phone'], msg))
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("📱 WhatsApp", key="wa_contribution"):
+                    try:
+                        send_whatsapp(member_row["phone"], msg)
+                        create_member_reminder(member_id, "cotisation", "Rappel de cotisation", msg, date.today(), True)
+                        st.success("Rappel envoyé sur WhatsApp et ajouté à l'espace membre.")
+                    except Exception as exc:
+                        st.error(str(exc))
+            with c2:
+                if st.button("👤 Espace membre", key="space_contribution"):
+                    create_member_reminder(member_id, "cotisation", "Rappel de cotisation", msg, date.today(), False)
+                    st.success("Rappel ajouté à l'espace membre.")
 
         with tab_r:
             rdf = all_installments()
@@ -3520,18 +3953,100 @@ elif page == "Rappels WhatsApp":
                     rr = inst_options[chosen]
                     msg = loan_message(member_row['full_name'], float(rr['remaining']), pd.to_datetime(rr['due_date']).date())
                     st.text_area("Message prérempli de remboursement", value=msg, height=190, key="loan_reminder_msg")
-                    st.link_button("💬 Ouvrir WhatsApp", whatsapp_link(member_row['phone'], msg))
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("📱 WhatsApp", key="wa_loan"):
+                            try:
+                                send_whatsapp(member_row["phone"], msg)
+                                create_member_reminder(member_id, "remboursement", "Rappel de remboursement", msg, pd.to_datetime(rr["due_date"]).date(), True)
+                                st.success("Rappel envoyé sur WhatsApp et ajouté à l'espace membre.")
+                            except Exception as exc:
+                                st.error(str(exc))
+                    with c2:
+                        if st.button("👤 Espace membre", key="space_loan"):
+                            create_member_reminder(member_id, "remboursement", "Rappel de remboursement", msg, pd.to_datetime(rr["due_date"]).date(), False)
+                            st.success("Rappel ajouté à l'espace membre.")
 
         with tab_p:
             default = f"Bonjour {member_row['full_name']},\n\n"
             custom = st.text_area("Votre remarque", value=default, height=200, key="personal_remark")
             st.caption("Le message est entièrement modifiable avant l'envoi.")
-            st.link_button("💬 Ouvrir WhatsApp avec ma remarque", whatsapp_link(member_row['phone'], custom))
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("📱 WhatsApp avec cette remarque", key="wa_remark"):
+                    try:
+                        send_whatsapp(member_row["phone"], custom)
+                        create_member_reminder(member_id, "remarque", "Remarque de l'administration", custom, None, True)
+                        st.success("Remarque envoyée sur WhatsApp et ajoutée à l'espace membre.")
+                    except Exception as exc:
+                        st.error(str(exc))
+            with c2:
+                if st.button("👤 Publier dans l'espace membre", key="space_remark"):
+                    create_member_reminder(member_id, "remarque", "Remarque de l'administration", custom, None, False)
+                    st.success("Remarque publiée dans l'espace membre.")
 
 
 # ============================================================
 # RAPPORT GLOBAL
 # ============================================================
+
+# ============================================================
+# COMMUNICATION ADMIN ↔ MEMBRES
+# ============================================================
+
+elif page == "Communication":
+    brand_hero("Communication", "Un espace de dialogue entre l'administration et chaque membre.", compact=True)
+    ctab1, ctab2 = st.tabs(["📥 Messages reçus", "📨 Écrire à un membre"])
+
+    with ctab1:
+        inbox = get_member_messages()
+        if inbox.empty:
+            st.info("Aucun message ou réclamation.")
+        else:
+            for _, r in inbox.iterrows():
+                sender = r["member_name"] or "Membre"
+                kind = "Réclamation" if r["message_type"] == "reclamation" else "Message"
+                with st.container(border=True):
+                    st.markdown(f"**👤 {sender} — {kind} — {r['subject'] or 'Sans objet'}**")
+                    st.write(str(r["message"]))
+                    st.caption(f"Reçu le {r['created_at']}")
+                    if not bool(r["is_read"]):
+                        mark_message_read(r["id"])
+                    with st.form(f"reply_form_{int(r['id'])}"):
+                        reply = st.text_area("Réponse", height=100, key=f"reply_{int(r['id'])}")
+                        send_reply = st.form_submit_button("📨 Répondre au membre")
+                        if send_reply:
+                            try:
+                                send_admin_message_to_member(int(r["member_id"]), f"Re: {r['subject'] or 'Message'}", reply)
+                                st.success("Réponse envoyée dans l'espace membre.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(str(exc))
+
+    with ctab2:
+        mdf = get_members(True)
+        if mdf.empty:
+            st.info("Aucun membre actif.")
+        else:
+            options = build_member_options(mdf, include_phone=False)
+            selected = st.selectbox("Membre destinataire", list(options.keys()), key="communication_member")
+            target_id = options[selected]
+            with st.form("admin_message_form"):
+                subject = st.text_input("Objet")
+                message_type = st.selectbox("Type", ["Message", "Réclamation / suivi", "Information"])
+                message = st.text_area("Message", height=160)
+                send = st.form_submit_button("📨 Envoyer dans l'espace membre", type="primary")
+                if send:
+                    try:
+                        send_admin_message_to_member(
+                            target_id, subject, message,
+                            "reclamation" if message_type == "Réclamation / suivi" else "message"
+                        )
+                        st.success("Message envoyé au membre.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
 
 elif page == "Rapport global":
 
