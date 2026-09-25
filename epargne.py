@@ -32,11 +32,6 @@ from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
 
-try:
-    from twilio.rest import Client
-except ImportError:
-    Client = None
-
 DB_PATH = Path("epargne_etudiant.db")
 
 ADMIN_NAME = "Abdou Latif ALD"
@@ -55,13 +50,6 @@ def secret_or_env(name, default=""):
         value = ""
     return value or os.getenv(name, default)
 
-
-TWILIO_ACCOUNT_SID = secret_or_env("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = secret_or_env("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_FROM = secret_or_env(
-    "TWILIO_WHATSAPP_FROM",
-    "whatsapp:+221777521969"
-)
 
 # Configuration Supabase / PostgreSQL.
 # On lit d'abord .streamlit/secrets.toml, puis les variables d'environnement.
@@ -2483,32 +2471,15 @@ def whatsapp_link(phone, message):
 
 
 def send_whatsapp(phone, message):
+    """Prépare un message WhatsApp sans Twilio.
 
-    if Client is None:
-        raise RuntimeError(
-            "Twilio n'est pas installé."
-        )
-
-    if not TWILIO_ACCOUNT_SID:
-        raise RuntimeError(
-            "TWILIO_ACCOUNT_SID n'est pas configuré."
-        )
-
-    if not TWILIO_AUTH_TOKEN:
-        raise RuntimeError(
-            "TWILIO_AUTH_TOKEN n'est pas configuré."
-        )
-
-    client = Client(
-        TWILIO_ACCOUNT_SID,
-        TWILIO_AUTH_TOKEN
-    )
-
-    return client.messages.create(
-        from_=TWILIO_WHATSAPP_FROM,
-        to="whatsapp:+" + normalize_phone(phone),
-        body=message,
-    )
+    WhatsApp ne permet pas à une application Streamlit de cliquer/envoyer
+    directement un message personnel sans passer par une API WhatsApp.
+    On ouvre donc WhatsApp avec le numéro et le message déjà remplis;
+    l'utilisateur n'a plus qu'à appuyer sur Envoyer dans WhatsApp.
+    """
+    url = whatsapp_link(phone, message)
+    return {"url": url, "phone": normalize_phone(phone), "message": message}
 
 
 def send_monthly_reminders():
@@ -2533,8 +2504,8 @@ def send_monthly_reminders():
             results.append({
                 "Membre": row["full_name"],
                 "Téléphone": row["phone"],
-                "Statut": "Envoyé",
-                "SID": getattr(sent, "sid", ""),
+                "Statut": "Lien WhatsApp prêt",
+                "WhatsApp": sent["url"],
             })
 
         except Exception as exc:
@@ -3931,15 +3902,24 @@ elif page == "Rappels WhatsApp":
             msg = contribution_message(row["full_name"])
             wa_status = "Non envoyé"
             try:
-                send_whatsapp(row["phone"], msg)
-                wa_status = "Envoyé"
+                wa = send_whatsapp(row["phone"], msg)
+                wa_status = "Lien WhatsApp prêt"
                 wa_sent = True
+                wa_url = wa["url"]
             except Exception as exc:
                 wa_sent = False
                 wa_status = f"Erreur : {exc}"
+                wa_url = ""
             create_member_reminder(row["id"], "cotisation", "Rappel de cotisation", msg, date.today(), wa_sent)
-            results.append({"Membre": row["full_name"], "WhatsApp": wa_status, "Espace membre": "Ajouté"})
-        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+            results.append({"Membre": row["full_name"], "WhatsApp": wa_status, "Ouvrir WhatsApp": wa_url, "Espace membre": "Ajouté"})
+        result_df = pd.DataFrame(results)
+        st.dataframe(
+            result_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={"Ouvrir WhatsApp": st.column_config.LinkColumn("💬 Ouvrir WhatsApp", display_text="Envoyer le message")}
+        )
+        st.caption("Le lien ouvre WhatsApp avec le numéro et le message déjà remplis. Il suffit d'appuyer sur Envoyer dans WhatsApp.")
 
     st.divider()
     mdf = get_members(True)
@@ -3957,9 +3937,10 @@ elif page == "Rappels WhatsApp":
             with c1:
                 if st.button("📱 WhatsApp", key="wa_contribution"):
                     try:
-                        send_whatsapp(member_row["phone"], msg)
+                        wa = send_whatsapp(member_row["phone"], msg)
                         create_member_reminder(member_id, "cotisation", "Rappel de cotisation", msg, date.today(), True)
-                        st.success("Rappel envoyé sur WhatsApp et ajouté à l'espace membre.")
+                        st.success("WhatsApp est prêt avec le message rempli. Cliquez sur le bouton ci-dessous pour l'envoyer.")
+                        st.link_button("💬 Ouvrir WhatsApp et envoyer", wa["url"], use_container_width=True)
                     except Exception as exc:
                         st.error(str(exc))
             with c2:
@@ -3987,9 +3968,10 @@ elif page == "Rappels WhatsApp":
                     with c1:
                         if st.button("📱 WhatsApp", key="wa_loan"):
                             try:
-                                send_whatsapp(member_row["phone"], msg)
+                                wa = send_whatsapp(member_row["phone"], msg)
                                 create_member_reminder(member_id, "remboursement", "Rappel de remboursement", msg, pd.to_datetime(rr["due_date"]).date(), True)
-                                st.success("Rappel envoyé sur WhatsApp et ajouté à l'espace membre.")
+                                st.success("WhatsApp est prêt avec le message rempli. Cliquez sur le bouton ci-dessous pour l'envoyer.")
+                                st.link_button("💬 Ouvrir WhatsApp et envoyer", wa["url"], use_container_width=True)
                             except Exception as exc:
                                 st.error(str(exc))
                     with c2:
@@ -4005,9 +3987,10 @@ elif page == "Rappels WhatsApp":
             with c1:
                 if st.button("📱 WhatsApp avec cette remarque", key="wa_remark"):
                     try:
-                        send_whatsapp(member_row["phone"], custom)
+                        wa = send_whatsapp(member_row["phone"], custom)
                         create_member_reminder(member_id, "remarque", "Remarque de l'administration", custom, None, True)
-                        st.success("Remarque envoyée sur WhatsApp et ajoutée à l'espace membre.")
+                        st.success("WhatsApp est prêt avec la remarque remplie. Cliquez sur le bouton ci-dessous pour l'envoyer.")
+                        st.link_button("💬 Ouvrir WhatsApp et envoyer", wa["url"], use_container_width=True)
                     except Exception as exc:
                         st.error(str(exc))
             with c2:
