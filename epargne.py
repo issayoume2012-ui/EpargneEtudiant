@@ -2,7 +2,7 @@ import os
 import sqlite3
 import base64
 import mimetypes
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
@@ -89,7 +89,7 @@ SUPABASE_SSLMODE = postgres_secret("sslmode", "require") or "require"
 SUPABASE_CONNECT_TIMEOUT = int(postgres_secret("connect_timeout", "10") or 10)
 
 # Visuel de marque fourni pour l'application et les bulletins PDF.
-ASSET_IMAGE = Path(__file__).with_name("peo.png")
+ASSET_IMAGE = Path(__file__).with_name("pe.jpeg")
 
 BRAND_NAVY = "#122A55"
 BRAND_BLUE = "#A9D4F5"
@@ -1632,47 +1632,32 @@ def add_contribution(member_id, payment_date, amount, note):
     return contribution_id
 
 
-def update_contribution(
-    contribution_id,
-    payment_date,
-    amount,
-    note
-):
-
+def update_contribution(contribution_id, payment_date, amount, note):
+    contribution_id = safe_int_id(contribution_id)
+    amount = float(amount)
+    if contribution_id is None or amount <= 0:
+        raise ValueError("Cotisation ou montant invalide.")
+    table = 'public.contributions' if use_supabase() else 'contributions'
     with db() as con:
-        con.execute(
-            """
-            UPDATE contributions
-            SET
-                payment_date=?,
-                amount=?,
-                month_label=?,
-                note=?
-            WHERE id=?
-            """,
-            (
-                payment_date.isoformat(),
-                float(amount),
-                month_label(payment_date),
-                note.strip(),
-                contribution_id,
-            )
+        cur = con.execute(
+            f"UPDATE {table} SET payment_date=?, amount=?, month_label=?, note=? WHERE id=?",
+            (payment_date.isoformat(), amount, month_label(payment_date), str(note or '').strip(), contribution_id)
         )
+        if cur.rowcount == 0:
+            raise ValueError("Cotisation introuvable.")
         con.commit()
-        member_account_data_cached.clear()
     refresh_application_data()
 
 
 def delete_contribution(contribution_id):
-
+    contribution_id = safe_int_id(contribution_id)
+    if contribution_id is None:
+        raise ValueError("Cotisation invalide.")
+    table = 'public.contributions' if use_supabase() else 'contributions'
     with db() as con:
-        con.execute(
-            "DELETE FROM contributions WHERE id=?",
-            (contribution_id,)
-        )
+        con.execute(f"DELETE FROM {table} WHERE id=?", (contribution_id,))
         con.commit()
     refresh_application_data()
-
 
 def _clean_contributions_df(df):
     """Nettoie les éventuelles lignes d'en-tête importées par erreur."""
@@ -1836,6 +1821,79 @@ def create_loan(
     return loan_id
 
 
+def update_loan(loan_id, member_id, loan_date, principal, rate, duration, first_due_date, note):
+    loan_id = safe_int_id(loan_id); member_id = safe_int_id(member_id)
+    principal = float(principal); rate = float(rate); duration = int(duration)
+    if loan_id is None or member_id is None:
+        raise ValueError("Prêt ou membre invalide.")
+    if principal <= 0 or rate < 0 or duration < 1 or duration > 60:
+        raise ValueError("Valeurs du prêt invalides.")
+    lt = 'public.loans' if use_supabase() else 'loans'
+    it = 'public.loan_installments' if use_supabase() else 'loan_installments'
+    total_due = principal * (1 + rate / 100.0)
+    with db() as con:
+        loan = con.execute(f"SELECT id FROM {lt} WHERE id=?", (loan_id,)).fetchone()
+        if not loan:
+            raise ValueError("Prêt introuvable.")
+        paid_row = con.execute(f"SELECT COALESCE(SUM(amount_paid),0) AS paid, COUNT(*) AS n FROM {it} WHERE loan_id=? AND COALESCE(amount_paid,0)>0", (loan_id,)).fetchone()
+        paid_total = float(paid_row['paid'] or 0)
+        paid_count = int(paid_row['n'] or 0)
+        old_count_row = con.execute(f"SELECT COUNT(*) AS n FROM {it} WHERE loan_id=?", (loan_id,)).fetchone()
+        old_count = int(old_count_row['n'] or 0)
+        if paid_count and duration != old_count:
+            raise ValueError("Le nombre d'échéances ne peut pas être modifié après le début des remboursements. Modifiez les échéances une par une.")
+        if total_due + 0.01 < paid_total:
+            raise ValueError("Le nouveau total dû ne peut pas être inférieur aux remboursements déjà enregistrés.")
+        con.execute(f"UPDATE {lt} SET member_id=?, loan_date=?, principal=?, interest_rate=?, total_due=?, duration_months=?, first_due_date=?, note=?, total_interest_rate=?, installments_count=? WHERE id=?",
+                    (member_id, loan_date.isoformat(), principal, rate, total_due, duration, first_due_date.isoformat(), str(note or '').strip(), rate, duration, loan_id))
+        rows = con.execute(f"SELECT id, installment_number, amount_paid FROM {it} WHERE loan_id=? ORDER BY installment_number", (loan_id,)).fetchall()
+        # Si aucun remboursement n'a commencé, la modification du nombre ou du début
+        # du calendrier reconstruit proprement les échéances.
+        if paid_count == 0:
+            con.execute(f"DELETE FROM {it} WHERE loan_id=?", (loan_id,))
+            installment = total_due / duration
+            for i in range(duration):
+                due_date = add_months(first_due_date, i)
+                amt = total_due - installment * (duration - 1) if i == duration - 1 else installment
+                con.execute(f"INSERT INTO {it}(loan_id, installment_number, due_date, amount_due, amount_paid) VALUES (?,?,?,?,0)",
+                            (loan_id, i + 1, due_date.isoformat(), round(amt,2)))
+        else:
+            # Après le début des remboursements, les lignes déjà payées restent intactes.
+            unpaid = [r for r in rows if float(r['amount_paid'] or 0) <= 0.01]
+            remaining = max(total_due - paid_total, 0)
+            if unpaid:
+                each = remaining / len(unpaid)
+                for idx, r in enumerate(unpaid):
+                    amt = remaining - each * (len(unpaid)-1) if idx == len(unpaid)-1 else each
+                    con.execute(f"UPDATE {it} SET amount_due=? WHERE id=?", (round(amt,2), r['id']))
+        con.commit()
+    refresh_application_data()
+
+
+def update_installment(installment_id, due_date, amount_due, amount_paid, payment_date, note):
+    installment_id = safe_int_id(installment_id)
+    if installment_id is None:
+        raise ValueError("Échéance invalide.")
+    amount_due = float(amount_due); amount_paid = float(amount_paid)
+    if amount_due <= 0 or amount_paid < 0:
+        raise ValueError("Les montants de l'échéance sont invalides.")
+    if amount_paid > amount_due + 0.01:
+        raise ValueError("Le montant remboursé ne peut pas dépasser le montant de l'échéance.")
+    it = 'public.loan_installments' if use_supabase() else 'loan_installments'
+    lt = 'public.loans' if use_supabase() else 'loans'
+    with db() as con:
+        row = con.execute(f"SELECT loan_id FROM {it} WHERE id=?", (installment_id,)).fetchone()
+        if not row:
+            raise ValueError("Échéance introuvable.")
+        loan_id = row['loan_id']
+        con.execute(f"UPDATE {it} SET due_date=?, amount_due=?, amount_paid=?, payment_date=?, note=? WHERE id=?",
+                     (due_date.isoformat(), amount_due, amount_paid, payment_date.isoformat() if payment_date else None, str(note or '').strip(), installment_id))
+        total = con.execute(f"SELECT COALESCE(SUM(amount_due),0) AS due, COALESCE(SUM(amount_paid),0) AS paid FROM {it} WHERE loan_id=?", (loan_id,)).fetchone()
+        status = "Remboursé" if float(total['paid'] or 0) >= float(total['due'] or 0)-0.01 else "Actif"
+        con.execute(f"UPDATE {lt} SET status=? WHERE id=?", (status, loan_id))
+        con.commit()
+    refresh_application_data()
+
 def loans(member_id=None):
     lt = 'public.loans' if use_supabase() else 'loans'
     mt = 'public.members' if use_supabase() else 'members'
@@ -1876,6 +1934,12 @@ def register_installment_payment(
 
         loan_id = row["loan_id"]
 
+        current = con.execute(f"SELECT amount_due FROM {it} WHERE id=?", (installment_id,)).fetchone()
+        if not current:
+            raise ValueError("Échéance introuvable.")
+        if float(amount_paid) < 0 or float(amount_paid) > float(current['amount_due'] or 0) + 0.01:
+            raise ValueError("Le montant remboursé doit être compris entre 0 et le montant de l'échéance.")
+
         con.execute(
             f"UPDATE {it} SET amount_paid=?, payment_date=?, note=? WHERE id=?",
             (
@@ -1913,6 +1977,42 @@ def register_installment_payment(
 
 
 # ============================================================
+# DATES / RAPPELS
+# ============================================================
+
+def _format_reminder_date(value):
+    """Formate une date venant de PostgreSQL, SQLite, Pandas ou datetime."""
+    if value is None:
+        return "Date non définie"
+    if isinstance(value, datetime):
+        return value.strftime("%d/%m/%Y")
+    if isinstance(value, date):
+        return value.strftime("%d/%m/%Y")
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+        if pd.notna(ts):
+            return ts.strftime("%d/%m/%Y")
+    except Exception:
+        pass
+    return str(value)
+
+def installment_status(due_date, amount_due, amount_paid):
+    """Statut lisible d'une échéance."""
+    due = float(amount_due or 0)
+    paid = float(amount_paid or 0)
+    if paid >= due - 0.01:
+        return "Payée"
+    if paid > 0:
+        return "Partiellement payée"
+    try:
+        due_d = pd.to_datetime(due_date).date()
+        if due_d < date.today():
+            return "En retard"
+    except Exception:
+        pass
+    return "À venir"
+
+# ============================================================
 # WHATSAPP
 # ============================================================
 
@@ -1932,119 +2032,28 @@ def contribution_message(member_name, d=None):
     )
 
 
-def _format_reminder_date(value):
-    """Retourne une date au format JJ/MM/AAAA de manière robuste."""
-    if isinstance(value, datetime):
-        value = value.date()
-
-    if isinstance(value, date):
-        return value.strftime("%d/%m/%Y")
-
-    try:
-        return date.fromisoformat(str(value)[:10]).strftime("%d/%m/%Y")
-    except Exception:
-        return str(value or "")
-
-
-def loan_message(member_name, amount, due_date):
-    """Message prérempli pour une échéance d'emprunt."""
-    due_label = _format_reminder_date(due_date)
-
-    return (
-        f"Bonjour {member_name},\n\n"
-        f"Rappel concernant votre échéance de remboursement "
-        f"de {money(amount)}, prévue le {due_label}.\n\n"
-        f"Merci d'effectuer votre remboursement dans les délais.\n\n"
-        f"Cordialement,\n"
-        f"{ADMIN_NAME}\n"
-        f"Épargne Étudiant"
-    )
-
-
-def repayment_message(
+def loan_message(
     member_name,
-    amount_due,
-    due_date,
-    amount_paid=0,
+    amount,
+    due_date
 ):
-    """Message prérempli pour rappeler une échéance d'emprunt."""
-    amount_due = max(float(amount_due or 0), 0)
-    amount_paid = max(float(amount_paid or 0), 0)
-    remaining = max(amount_due - amount_paid, 0)
-    due_label = _format_reminder_date(due_date)
-
-    if remaining <= 0.01:
-        status_text = (
-            "Cette échéance est déjà entièrement remboursée."
-        )
-    elif amount_paid > 0:
-        status_text = (
-            f"Un montant de {money(amount_paid)} a déjà été versé. "
-            f"Il reste {money(remaining)} à régler."
-        )
-    else:
-        status_text = (
-            f"Le montant restant à régler est de {money(remaining)}."
-        )
 
     return (
         f"Bonjour {member_name},\n\n"
-        f"📌 Rappel de remboursement\n\n"
-        f"Votre échéance prévue le {due_label} "
-        f"est de {money(amount_due)}.\n"
-        f"{status_text}\n\n"
-        f"Merci d'effectuer votre remboursement dès que possible.\n\n"
+        f"Rappel concernant votre échéance de prêt "
+        f"de {money(amount)}, prévue le "
+        f"{due_date.strftime('%d/%m/%Y')}.\n\n"
+        f"Merci d'effectuer votre remboursement "
+        f"dans les délais.\n\n"
         f"Cordialement,\n"
         f"{ADMIN_NAME}\n"
         f"Épargne Étudiant"
-    )
-
-
-def remark_message(member_name, remark):
-    """Construit un message à partir de la remarque exacte de l'administrateur."""
-    remark = str(remark or "").strip()
-
-    if not remark:
-        return ""
-
-    return (
-        f"Bonjour {member_name},\n\n"
-        f"{remark}\n\n"
-        f"Merci de votre attention.\n\n"
-        f"Cordialement,\n"
-        f"{ADMIN_NAME}\n"
-        f"Épargne Étudiant"
-    )
-
-
-def member_installments_for_reminder(member_id):
-    """Récupère les échéances d'un membre pour préparer un rappel de remboursement."""
-    it = 'public.loan_installments' if use_supabase() else 'loan_installments'
-    lt = 'public.loans' if use_supabase() else 'loans'
-
-    return read_sql(
-        f"""
-        SELECT
-            i.id,
-            i.loan_id,
-            i.installment_number,
-            i.due_date,
-            i.amount_due,
-            i.amount_paid,
-            i.payment_date,
-            i.note,
-            l.principal,
-            l.status AS loan_status
-        FROM {it} i
-        JOIN {lt} l ON l.id=i.loan_id
-        WHERE l.member_id=?
-        ORDER BY i.due_date, i.id
-        """,
-        [int(member_id)]
     )
 
 
 def whatsapp_link(phone, message):
+
+    phone = normalize_phone(phone)
 
     return (
         "https://wa.me/"
@@ -2243,6 +2252,14 @@ def generate_member_pdf(member_id):
     member = member_rows.iloc[0]
     cdf = contributions(member_id)
     ldf = loans(member_id)
+    idf = pd.DataFrame()
+    try:
+        loan_ids = [safe_int_id(v) for v in ldf.get("id", pd.Series(dtype=object)).tolist()] if not ldf.empty else []
+        frames = [get_installments(lid) for lid in loan_ids if lid is not None]
+        if frames:
+            idf = pd.concat(frames, ignore_index=True)
+    except Exception:
+        idf = pd.DataFrame()
 
     # Les colonnes peuvent être absentes ou contenir des valeurs texte/NULL.
     # On normalise toujours les montants avant le calcul pour éviter le ValueError.
@@ -2252,6 +2269,11 @@ def generate_member_pdf(member_id):
     total_saved = float(amount_series.sum())
     total_borrowed = float(principal_series.sum())
     total_due = float(due_series.sum())
+    paid_series = pd.to_numeric(idf.get("amount_paid", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    installment_due_series = pd.to_numeric(idf.get("amount_due", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    total_repaid = float(paid_series.sum())
+    total_installment_due = float(installment_due_series.sum())
+    total_remaining = max(total_installment_due - total_repaid, 0)
 
     buffer = BytesIO()
     doc = SimpleDocTemplate(
@@ -2328,14 +2350,13 @@ def generate_member_pdf(member_id):
     story.append(Spacer(1, 7 * mm))
 
     # Cartes de synthèse.
-    summary_data = [
-        [
-            Paragraph("<b>ÉPARGNE</b><br/><font size=15>%s</font>" % money(total_saved), styles["Normal"]),
-            Paragraph("<b>EMPRUNTS</b><br/><font size=15>%s</font>" % money(total_borrowed), styles["Normal"]),
-            Paragraph("<b>À REMBOURSER</b><br/><font size=15>%s</font>" % money(total_due), styles["Normal"]),
-        ]
-    ]
-    summary = Table(summary_data, colWidths=[59.5 * mm] * 3)
+    summary_data = [[
+        Paragraph("<b>ÉPARGNE</b><br/><font size=14>%s</font>" % money(total_saved), styles["Normal"]),
+        Paragraph("<b>EMPRUNTÉ</b><br/><font size=14>%s</font>" % money(total_borrowed), styles["Normal"]),
+        Paragraph("<b>REMBOURSÉ</b><br/><font size=14>%s</font>" % money(total_repaid), styles["Normal"]),
+        Paragraph("<b>RESTE À PAYER</b><br/><font size=14>%s</font>" % money(total_remaining), styles["Normal"]),
+    ]]
+    summary = Table(summary_data, colWidths=[44.6 * mm] * 4)
     summary.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#EAF5FB")),
         ("BACKGROUND", (1, 0), (1, 0), colors.HexColor("#FFF0F3")),
@@ -2421,6 +2442,40 @@ def generate_member_pdf(member_id):
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
     story.append(loan_table)
+    story.append(Spacer(1, 6 * mm))
+
+    # Historique détaillé des échéances et remboursements du membre.
+    story.append(Paragraph("Historique des remboursements et solde", heading_style))
+    payment_data = [["Échéance", "Date prévue", "Prévu", "Remboursé", "Reste", "Date paiement", "Statut"]]
+    for _, r in idf.sort_values(["due_date", "id"] if not idf.empty and "id" in idf.columns else ["due_date"]).iterrows():
+        due = float(r.get("amount_due", 0) or 0)
+        paid = float(r.get("amount_paid", 0) or 0)
+        payment_data.append([
+            str(r.get("installment_number", "")),
+            _format_reminder_date(r.get("due_date")),
+            money(due),
+            money(paid),
+            money(max(due-paid, 0)),
+            _format_reminder_date(r.get("payment_date")) if r.get("payment_date") else "—",
+            installment_status(r.get("due_date"), due, paid),
+        ])
+    if len(payment_data) == 1:
+        payment_data.append(["—", "—", money(0), money(0), money(0), "—", "Aucun remboursement"])
+    payment_table = Table(payment_data, repeatRows=1, colWidths=[15*mm, 24*mm, 28*mm, 28*mm, 25*mm, 27*mm, 32*mm])
+    payment_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor(BRAND_NAVY)),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 7.3),
+        ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#D8E0E8")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F7FAFC")]),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("LEFTPADDING", (0,0), (-1,-1), 4),
+        ("RIGHTPADDING", (0,0), (-1,-1), 4),
+        ("TOPPADDING", (0,0), (-1,-1), 4),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+    ]))
+    story.append(payment_table)
     story.append(Spacer(1, 7 * mm))
 
     story.append(
@@ -3259,98 +3314,50 @@ elif page == "Membres":
 # ============================================================
 
 elif page == "Cotisations":
-
-    brand_hero("Les cotisations", "Enregistrez chaque versement réel et gardez une trace précise de l'épargne.")
-
+    brand_hero("Les cotisations", "Enregistrez, consultez et modifiez chaque versement.", compact=True)
     mdf = get_members(True)
-
     if mdf.empty:
-
-        st.warning(
-            "Aucun membre actif trouvé."
-        )
-        st.info(
-            "Si le membre apparaît dans Supabase mais pas ici, utilisez "
-            "« 🔄 Actualiser les données » dans la barre supérieure. "
-            "Les membres avec active = TRUE ou NULL sont considérés comme actifs."
-        )
-
+        st.warning("Aucun membre actif trouvé.")
     else:
-
         member_options = build_member_options(mdf)
-
         with st.form("contribution_form"):
-
-            selected = st.selectbox(
-                "Membre",
-                list(member_options.keys())
-            )
-
-            member_id = member_options.get(selected)
-            if member_id is None:
-                st.warning("Le membre sélectionné n'est plus disponible. Actualisez la page.")
-                st.stop()
-
-            payment_date = st.date_input(
-                "Date réelle du paiement",
-                value=date.today()
-            )
-
-            amount = st.number_input(
-                "Montant réellement versé",
-                min_value=0.0,
-                step=500.0
-            )
-
-            note = st.text_input(
-                "Note"
-            )
-
-            submit = st.form_submit_button(
-                "Enregistrer la cotisation"
-            )
-
+            selected = st.selectbox("Membre", list(member_options.keys()), key="new_contribution_member")
+            payment_date = st.date_input("Date réelle du paiement", value=date.today())
+            amount = st.number_input("Montant réellement versé", min_value=0.01, step=500.0)
+            note = st.text_input("Note")
+            submit = st.form_submit_button("Enregistrer la cotisation")
             if submit:
-
-                add_contribution(
-                    member_id,
-                    payment_date,
-                    amount,
-                    note
-                )
-
-                st.success(
-                    "Cotisation enregistrée."
-                )
-
-                st.rerun()
-
+                try:
+                    add_contribution(member_options[selected], payment_date, amount, note)
+                    st.success("Cotisation enregistrée.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
         st.divider()
-
         cdf = contributions()
-
-        # Tableau lisible : le membre et son montant sont visibles directement.
-        display_cdf = cdf.copy()
-        if not display_cdf.empty:
-            display_cdf = display_cdf.rename(columns={
-                "full_name": "Membre",
-                "payment_date": "Date",
-                "month_label": "Mois",
-                "amount": "Montant",
-                "note": "Note",
-            })
-            display_cdf = display_cdf[["Membre", "Date", "Mois", "Montant", "Note"]]
-            display_cdf["Montant"] = pd.to_numeric(
-                display_cdf["Montant"], errors="coerce"
-            ).fillna(0).map(money)
-        else:
-            display_cdf = pd.DataFrame(columns=["Membre", "Date", "Mois", "Montant", "Note"])
-
-        st.dataframe(
-            display_cdf,
-            use_container_width=True,
-            hide_index=True
-        )
+        st.subheader("📋 Historique des cotisations")
+        display = cdf.copy()
+        if not display.empty:
+            display['Montant'] = pd.to_numeric(display['amount'], errors='coerce').fillna(0).map(money)
+            display = display.rename(columns={'full_name':'Membre','payment_date':'Date','month_label':'Mois','note':'Note'})[['id','Membre','Date','Mois','Montant','Note']]
+        st.dataframe(display, use_container_width=True, hide_index=True)
+        if not cdf.empty:
+            copts = {f"#{safe_int_id(r['id'])} — {r['full_name']} — {money(r['amount'])} — {r['payment_date']}": safe_int_id(r['id']) for _,r in cdf.iterrows() if safe_int_id(r.get('id')) is not None}
+            selected_c = st.selectbox("Cotisation à modifier", list(copts.keys()), key="edit_contribution_select")
+            cid = copts[selected_c]
+            crow = cdf[cdf['id'].map(safe_int_id)==cid].iloc[0]
+            with st.form("edit_contribution_form"):
+                edit_date = st.date_input("Date", value=pd.to_datetime(crow['payment_date']).date())
+                edit_amount = st.number_input("Montant", min_value=0.01, value=float(crow['amount']), step=500.0)
+                edit_note = st.text_input("Note", value=str(crow['note'] or ''))
+                save_c = st.form_submit_button("💾 Modifier la cotisation")
+                if save_c:
+                    try:
+                        update_contribution(cid, edit_date, edit_amount, edit_note)
+                        st.success("Cotisation modifiée.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
 
 
 # ============================================================
@@ -3358,204 +3365,103 @@ elif page == "Cotisations":
 # ============================================================
 
 elif page == "Emprunts":
-
-    brand_hero("Les emprunts", "Suivez les prêts, les échéances et les remboursements sans perdre le fil.")
-
+    brand_hero("Les emprunts", "Prêts, échéances, remboursements et historique de paiement au même endroit.", compact=True)
     mdf = get_members(True)
-
     if mdf.empty:
-
-        st.warning(
-            "Aucun membre actif trouvé."
-        )
-        st.info(
-            "Si le membre apparaît dans Supabase mais pas ici, utilisez "
-            "« 🔄 Actualiser les données » dans la barre supérieure. "
-            "Les membres avec active = TRUE ou NULL sont considérés comme actifs."
-        )
-
+        st.warning("Aucun membre actif trouvé.")
     else:
-
-        options = {
-            f"{r['full_name']} — {r['phone']}": rid
-            for _, r in mdf.iterrows()
-            if (rid := safe_int_id(r.get("id"))) is not None
-        }
-
+        options = build_member_options(mdf)
         with st.form("loan_form"):
-
-            option_labels = list(options.keys())
-            if not option_labels:
-                st.warning("Aucun membre sélectionnable.")
-                st.stop()
-
-            selected = st.selectbox(
-                "Membre",
-                option_labels,
-                index=0,
-                key="loan_member_select"
-            )
-
+            selected = st.selectbox("Membre", list(options.keys()), key="new_loan_member")
             member_id = options.get(selected)
-            if member_id is None:
-                st.warning("Le membre sélectionné n'est plus disponible. Actualisez la page.")
-                st.stop()
-
-            loan_date = st.date_input(
-                "Date du prêt",
-                value=date.today()
-            )
-
-            principal = st.number_input(
-                "Montant du prêt",
-                min_value=1.0,
-                step=1000.0
-            )
-
-            rate = st.number_input(
-                "Taux d'intérêt total (%)",
-                min_value=0.0,
-                step=0.5
-            )
-
-            duration = st.number_input(
-                "Nombre d'échéances",
-                min_value=1,
-                max_value=60,
-                value=1
-            )
-
-            first_due_date = st.date_input(
-                "Première échéance",
-                value=date.today()
-            )
-
-            note = st.text_input(
-                "Note"
-            )
-
-            submit = st.form_submit_button(
-                "Enregistrer le prêt"
-            )
-
+            loan_date = st.date_input("Date du prêt", value=date.today())
+            principal = st.number_input("Montant du prêt", min_value=1.0, step=1000.0)
+            rate = st.number_input("Taux d'intérêt total (%)", min_value=0.0, step=0.5)
+            duration = st.number_input("Nombre d'échéances", min_value=1, max_value=60, value=1)
+            first_due_date = st.date_input("Première échéance", value=date.today())
+            note = st.text_input("Note")
+            submit = st.form_submit_button("Enregistrer le prêt")
             if submit:
-
-                create_loan(
-                    member_id,
-                    loan_date,
-                    principal,
-                    rate,
-                    duration,
-                    first_due_date,
-                    note
-                )
-
-                st.success(
-                    "Prêt enregistré avec ses échéances."
-                )
-
-                st.rerun()
+                try:
+                    create_loan(member_id, loan_date, principal, rate, duration, first_due_date, note)
+                    st.success("Prêt enregistré avec ses échéances.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
 
         st.divider()
-
         ldf = loans()
-
-        st.dataframe(
-            ldf,
-            use_container_width=True,
-            hide_index=True
-        )
+        st.subheader("📋 Historique des emprunts")
+        st.dataframe(ldf, use_container_width=True, hide_index=True)
 
         if not ldf.empty:
+            loan_options = {f"#{safe_int_id(r['id'])} — {r['full_name']} — {money(r['principal'])}": safe_int_id(r['id']) for _,r in ldf.iterrows() if safe_int_id(r.get('id')) is not None}
+            selected_loan_label = st.selectbox("Prêt à gérer", list(loan_options.keys()), key="manage_loan_select")
+            loan_id = loan_options[selected_loan_label]
+            loan_row = ldf[ldf['id'].map(safe_int_id)==loan_id].iloc[0]
 
-            st.subheader(
-                "Remboursement d'une échéance"
-            )
+            with st.expander("✏️ Modifier le prêt", expanded=False):
+                member_opts = build_member_options(mdf)
+                current_member_label = next((k for k,v in member_opts.items() if v == safe_int_id(loan_row['member_id'])), list(member_opts.keys())[0])
+                with st.form("edit_loan_form"):
+                    edit_member_label = st.selectbox("Membre", list(member_opts.keys()), index=list(member_opts.keys()).index(current_member_label))
+                    edit_loan_date = st.date_input("Date du prêt", value=pd.to_datetime(loan_row['loan_date']).date())
+                    edit_principal = st.number_input("Montant du prêt", min_value=1.0, value=float(loan_row['principal']), step=1000.0)
+                    edit_rate = st.number_input("Taux d'intérêt total (%)", min_value=0.0, value=float(loan_row['interest_rate']), step=0.5)
+                    edit_duration = st.number_input("Nombre d'échéances", min_value=1, max_value=60, value=int(loan_row['duration_months']))
+                    edit_first_due = st.date_input("Première échéance", value=pd.to_datetime(loan_row['first_due_date']).date())
+                    edit_note = st.text_input("Note", value=str(loan_row['note'] or ''))
+                    save_loan = st.form_submit_button("💾 Enregistrer les modifications")
+                    if save_loan:
+                        try:
+                            update_loan(loan_id, member_opts[edit_member_label], edit_loan_date, edit_principal, edit_rate, edit_duration, edit_first_due, edit_note)
+                            st.success("Prêt modifié.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
 
-            loan_options = {
-                f"#{rid} — {r['full_name']} — {money(r['principal'])}": rid
-                for _, r in ldf.iterrows()
-                if (rid := safe_int_id(r.get("id"))) is not None
-            }
-
-            loan_label = st.selectbox(
-                "Prêt",
-                list(loan_options.keys())
-            )
-
-            loan_id = loan_options.get(loan_label)
-            if loan_id is None:
-                st.warning("Le prêt sélectionné n'est plus disponible. Actualisez les données.")
-                st.stop()
-
-            idf = get_installments(loan_id)
-
-            st.dataframe(
-                idf,
-                use_container_width=True,
-                hide_index=True
-            )
-
+            idf = get_installments(loan_id).copy()
             if not idf.empty:
+                idf['Statut'] = [installment_status(r['due_date'], r['amount_due'], r['amount_paid']) for _,r in idf.iterrows()]
+                idf['Reste'] = (pd.to_numeric(idf['amount_due'], errors='coerce').fillna(0)-pd.to_numeric(idf['amount_paid'], errors='coerce').fillna(0)).clip(lower=0)
+                st.subheader("📅 Historique des paiements selon les échéances")
+                hist = idf.rename(columns={'installment_number':'Échéance #','due_date':'Date prévue','amount_due':'Montant prévu','amount_paid':'Montant remboursé','payment_date':'Date remboursement','note':'Note'})
+                hist['Montant prévu'] = hist['Montant prévu'].map(money); hist['Montant remboursé'] = hist['Montant remboursé'].map(money); hist['Reste'] = hist['Reste'].map(money)
+                st.dataframe(hist[['Échéance #','Date prévue','Montant prévu','Montant remboursé','Reste','Date remboursement','Statut','Note']], use_container_width=True, hide_index=True)
 
-                installment_options = {
-                    f"#{rid} — {r['due_date']} — dû {money(r['amount_due'])}": rid
-                    for _, r in idf.iterrows()
-                    if (rid := safe_int_id(r.get("id"))) is not None
-                }
+                inst_options = {f"Échéance #{int(r['installment_number'])} — {r['due_date']} — {money(r['amount_due'])}": safe_int_id(r['id']) for _,r in idf.iterrows() if safe_int_id(r.get('id')) is not None}
+                selected_inst_label = st.selectbox("Échéance à modifier / rembourser", list(inst_options.keys()), key="manage_installment_select")
+                installment_id = inst_options[selected_inst_label]
+                selected_row = idf[idf['id'].map(safe_int_id)==installment_id].iloc[0]
 
-                selected_installment = st.selectbox(
-                    "Échéance",
-                    list(installment_options.keys())
-                )
+                with st.form("edit_installment_form"):
+                    dval = pd.to_datetime(selected_row['due_date']).date()
+                    edit_due = st.date_input("Échéance (date modifiable)", value=dval)
+                    edit_due_amount = st.number_input("Montant de l'échéance", min_value=0.01, value=float(selected_row['amount_due']), step=500.0)
+                    edit_paid = st.number_input("Montant remboursé", min_value=0.0, value=float(selected_row['amount_paid'] or 0), step=500.0)
+                    current_pay_date = pd.to_datetime(selected_row['payment_date']).date() if pd.notna(selected_row['payment_date']) and str(selected_row['payment_date']).strip() else date.today()
+                    edit_pay_date = st.date_input("Date du remboursement", value=current_pay_date)
+                    edit_inst_note = st.text_input("Note", value=str(selected_row['note'] or ''))
+                    c1,c2 = st.columns(2)
+                    save_inst = c1.form_submit_button("💾 Enregistrer échéance / paiement")
+                    clear_payment = c2.form_submit_button("↩️ Marquer non payé")
+                    if save_inst or clear_payment:
+                        try:
+                            if clear_payment:
+                                update_installment(installment_id, edit_due, edit_due_amount, 0, None, edit_inst_note)
+                            else:
+                                update_installment(installment_id, edit_due, edit_due_amount, edit_paid, edit_pay_date, edit_inst_note)
+                            st.success("Échéance et remboursement mis à jour.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
 
-                installment_id = installment_options.get(selected_installment)
-                if installment_id is None:
-                    st.warning("L'échéance sélectionnée n'est plus disponible. Actualisez les données.")
-                    st.stop()
-
-                selected_row = idf[
-                    idf["id"] == installment_id
-                ].iloc[0]
-
-                with st.form("payment_form"):
-
-                    amount_paid = st.number_input(
-                        "Montant payé",
-                        min_value=0.0,
-                        value=float(
-                            selected_row["amount_paid"] or 0
-                        ),
-                        step=500.0
-                    )
-
-                    payment_date = st.date_input(
-                        "Date du remboursement",
-                        value=date.today()
-                    )
-
-                    note = st.text_input(
-                        "Note du remboursement"
-                    )
-
-                    submit = st.form_submit_button(
-                        "Enregistrer le remboursement"
-                    )
-
-                    if submit:
-
-                        register_installment_payment(
-                            installment_id,
-                            amount_paid,
-                            payment_date,
-                            note
-                        )
-
-                        st.success(
-                            "Remboursement enregistré."
-                        )
-
-                        st.rerun()
+                total_due = float(pd.to_numeric(idf['amount_due'], errors='coerce').fillna(0).sum())
+                total_paid = float(pd.to_numeric(idf['amount_paid'], errors='coerce').fillna(0).sum())
+                c1,c2,c3 = st.columns(3)
+                c1.metric("Total prévu", money(total_due))
+                c2.metric("Total remboursé", money(total_paid))
+                c3.metric("Reste à payer", money(max(total_due-total_paid,0)))
 
 
 # ============================================================
@@ -3563,270 +3469,55 @@ elif page == "Emprunts":
 # ============================================================
 
 elif page == "Rappels WhatsApp":
+    brand_hero("Rappels WhatsApp", "Préparez des rappels de cotisation, de remboursement ou des remarques personnalisées.", compact=True)
+    st.info(f"Numéro administratif configuré : +{WHATSAPP}")
 
-    brand_hero(
-        "Rappels WhatsApp",
-        "Préparez et envoyez facilement des rappels de cotisation, de remboursement ou des remarques personnalisées.",
-        compact=True,
-    )
-
-    st.info(
-        f"Numéro administratif configuré : +{WHATSAPP}"
-    )
-
-    # --------------------------------------------------------
-    # RAPPELS DE COTISATION
-    # --------------------------------------------------------
-    st.subheader("📅 Rappels de cotisation")
-
-    st.write(
-        "Le rappel mensuel peut être envoyé à tous les membres actifs. "
-        "Le message est automatiquement personnalisé avec le nom du membre."
-    )
-
+    st.subheader("📅 Rappel mensuel des cotisations")
     if date.today().day == 8:
-        st.success(
-            "Nous sommes le 8 : c'est la journée prévue pour les rappels mensuels."
-        )
-
-    if st.button(
-        "📨 Envoyer les rappels de cotisation maintenant",
-        key="send_contribution_reminders",
-    ):
+        st.success("Nous sommes le 8 : journée prévue pour les rappels mensuels.")
+    if st.button("📨 Envoyer les rappels mensuels maintenant"):
         try:
-            results = send_monthly_reminders()
-            st.dataframe(
-                results,
-                use_container_width=True,
-                hide_index=True,
-            )
+            st.dataframe(send_monthly_reminders(), use_container_width=True, hide_index=True)
         except Exception as exc:
             st.error(str(exc))
 
     st.divider()
-
-    # --------------------------------------------------------
-    # MESSAGES INDIVIDUELS
-    # --------------------------------------------------------
-    st.subheader("💬 Messages WhatsApp individuels")
-
-    st.caption(
-        "Sélectionnez un membre, choisissez le type de message, "
-        "modifiez le texte si nécessaire, puis envoyez-le manuellement "
-        "en ouvrant WhatsApp."
-    )
-
     mdf = get_members(True)
+    if not mdf.empty:
+        member_options = build_member_options(mdf)
+        selected = st.selectbox("Membre", list(member_options.keys()), key="reminder_member")
+        member_id = member_options[selected]
+        member_row = mdf[mdf['id'].map(safe_int_id)==member_id].iloc[0]
 
-    if mdf.empty:
-        st.info("Aucun membre actif disponible.")
-    else:
-        options = {}
+        tab_c, tab_r, tab_p = st.tabs(["💰 Cotisation", "💳 Remboursement", "✍️ Remarque personnelle"])
+        with tab_c:
+            msg = contribution_message(member_row['full_name'])
+            st.text_area("Message prérempli", value=msg, height=170, key="contribution_reminder_msg")
+            st.link_button("💬 Ouvrir WhatsApp", whatsapp_link(member_row['phone'], msg))
 
-        for _, r in mdf.iterrows():
-            member_id = safe_int_id(r.get("id"))
-            member_name = str(r.get("full_name") or "").strip()
-
-            if member_id is None or not member_name:
-                continue
-
-            phone = normalize_phone(r.get("phone"))
-            label = f"{member_name} — +{phone}" if phone else member_name
-            options[f"{label} · ID {member_id}"] = r
-
-        if not options:
-            st.info("Aucun membre actif avec un nom valide.")
-        else:
-            selected = st.selectbox(
-                "Membre",
-                list(options.keys()),
-                key="whatsapp_member_select",
-            )
-
-            member = options[selected]
-            member_id = safe_int_id(member.get("id"))
-            member_name = str(member.get("full_name") or "").strip()
-            member_phone = normalize_phone(member.get("phone"))
-
-            if not member_phone:
-                st.warning(
-                    f"Aucun numéro WhatsApp valide n'est enregistré pour {member_name}."
-                )
-                st.stop()
-
-            message_type = st.selectbox(
-                "Type de message",
-                [
-                    "💰 Rappel de cotisation",
-                    "💳 Rappel de remboursement",
-                    "📌 Remarque personnalisée",
-                ],
-                key="whatsapp_message_type",
-            )
-
-            message = ""
-
-            # ------------------------------------------------
-            # COTISATION
-            # ------------------------------------------------
-            if message_type == "💰 Rappel de cotisation":
-
-                message = contribution_message(member_name)
-
-            # ------------------------------------------------
-            # REMBOURSEMENT / EMPRUNT
-            # ------------------------------------------------
-            elif message_type == "💳 Rappel de remboursement":
-
-                idf = member_installments_for_reminder(member_id)
-
-                if idf.empty:
-                    st.warning(
-                        "Aucune échéance n'est enregistrée pour ce membre."
-                    )
+        with tab_r:
+            rdf = all_installments()
+            rdf = rdf[rdf['member_id'].map(safe_int_id)==member_id].copy() if not rdf.empty else rdf
+            if rdf.empty:
+                st.info("Aucune échéance de remboursement pour ce membre.")
+            else:
+                rdf['remaining'] = (pd.to_numeric(rdf['amount_due'], errors='coerce').fillna(0)-pd.to_numeric(rdf['amount_paid'], errors='coerce').fillna(0)).clip(lower=0)
+                pending = rdf[rdf['remaining'] > 0.01].copy()
+                if pending.empty:
+                    st.success("Toutes les échéances de ce membre sont soldées.")
                 else:
-                    installment_options = {}
+                    inst_options = {f"Échéance #{int(r['installment_number'])} — {r['due_date']} — reste {money(r['remaining'])}": r for _,r in pending.iterrows()}
+                    chosen = st.selectbox("Échéance à rappeler", list(inst_options.keys()), key="reminder_installment")
+                    rr = inst_options[chosen]
+                    msg = loan_message(member_row['full_name'], float(rr['remaining']), pd.to_datetime(rr['due_date']).date())
+                    st.text_area("Message prérempli de remboursement", value=msg, height=190, key="loan_reminder_msg")
+                    st.link_button("💬 Ouvrir WhatsApp", whatsapp_link(member_row['phone'], msg))
 
-                    for _, row in idf.iterrows():
-
-                        rid = safe_int_id(row.get("id"))
-                        if rid is None:
-                            continue
-
-                        amount_due = float(row.get("amount_due") or 0)
-                        amount_paid = float(row.get("amount_paid") or 0)
-                        remaining = max(amount_due - amount_paid, 0)
-
-                        due_date = row.get("due_date")
-                        due_label = _format_reminder_date(due_date)
-
-                        status_label = (
-                            "✓ Remboursée"
-                            if remaining <= 0.01
-                            else f"Reste {money(remaining)}"
-                        )
-
-                        installment_options[
-                            f"Échéance #{row.get('installment_number')} — "
-                            f"{due_label} — {status_label}"
-                        ] = {
-                            "id": rid,
-                            "due_date": due_date,
-                            "amount_due": amount_due,
-                            "amount_paid": amount_paid,
-                            "remaining": remaining,
-                        }
-
-                    if installment_options:
-
-                        selected_installment = st.selectbox(
-                            "Échéance à rappeler",
-                            list(installment_options.keys()),
-                            key="whatsapp_installment_select",
-                        )
-
-                        installment = installment_options[selected_installment]
-
-                        if installment["remaining"] <= 0.01:
-                            st.info(
-                                "Cette échéance est déjà entièrement remboursée."
-                            )
-
-                        message = repayment_message(
-                            member_name,
-                            installment["amount_due"],
-                            installment["due_date"],
-                            installment["amount_paid"],
-                        )
-
-            # ------------------------------------------------
-            # REMARQUE PERSONNALISÉE
-            # ------------------------------------------------
-            elif message_type == "📌 Remarque personnalisée":
-
-                st.info(
-                    "Écrivez exactement la remarque que vous souhaitez "
-                    "transmettre au membre. Elle sera intégrée dans le message."
-                )
-
-                remark = st.text_area(
-                    "Votre remarque",
-                    placeholder=(
-                        "Exemple : Bonjour, merci de régulariser votre "
-                        "cotisation avant le 30 septembre."
-                    ),
-                    height=140,
-                    key=f"whatsapp_remark_{member_id}",
-                )
-
-                if remark.strip():
-                    message = remark_message(
-                        member_name,
-                        remark,
-                    )
-                else:
-                    st.warning(
-                        "Écrivez une remarque avant de générer le message."
-                    )
-
-            # ------------------------------------------------
-            # APERÇU + ENVOI MANUEL
-            # ------------------------------------------------
-            if message:
-
-                preview_key = (
-                    f"whatsapp_preview_{member_id}_"
-                    f"{message_type.replace(' ', '_')}"
-                )
-
-                edited_message = st.text_area(
-                    "Message à envoyer — modifiable",
-                    value=message,
-                    height=240,
-                    key=preview_key,
-                )
-
-                st.markdown("**Envoi manuel**")
-
-                st.link_button(
-                    "📱 Envoyer manuellement via WhatsApp",
-                    whatsapp_link(
-                        member_phone,
-                        edited_message,
-                    ),
-                    use_container_width=True,
-                )
-
-                st.caption(
-                    "Le bouton ouvre WhatsApp avec le message déjà rempli. "
-                    "Vous pouvez encore le relire et appuyer sur « Envoyer » dans WhatsApp."
-                )
-
-                # L'envoi automatique Twilio reste disponible uniquement
-                # lorsque les identifiants sont correctement configurés.
-                if (
-                    TWILIO_ACCOUNT_SID
-                    and TWILIO_AUTH_TOKEN
-                    and Client is not None
-                ):
-                    if st.button(
-                        "📤 Envoyer automatiquement via Twilio",
-                        key=f"whatsapp_direct_send_{member_id}_{message_type}",
-                        use_container_width=True,
-                    ):
-                        try:
-                            sent = send_whatsapp(
-                                member_phone,
-                                edited_message,
-                            )
-
-                            st.success(
-                                f"Message envoyé à {member_name}. "
-                                f"SID : {getattr(sent, 'sid', '')}"
-                            )
-
-                        except Exception as exc:
-                            st.error(str(exc))
+        with tab_p:
+            default = f"Bonjour {member_row['full_name']},\n\n"
+            custom = st.text_area("Votre remarque", value=default, height=200, key="personal_remark")
+            st.caption("Le message est entièrement modifiable avant l'envoi.")
+            st.link_button("💬 Ouvrir WhatsApp avec ma remarque", whatsapp_link(member_row['phone'], custom))
 
 
 # ============================================================
