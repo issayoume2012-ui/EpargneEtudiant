@@ -89,7 +89,7 @@ SUPABASE_SSLMODE = postgres_secret("sslmode", "require") or "require"
 SUPABASE_CONNECT_TIMEOUT = int(postgres_secret("connect_timeout", "10") or 10)
 
 # Visuel de marque fourni pour l'application et les bulletins PDF.
-ASSET_IMAGE = Path(__file__).with_name("pe.jpeg")
+ASSET_IMAGE = Path(__file__).with_name("peo.png")
 
 BRAND_NAVY = "#122A55"
 BRAND_BLUE = "#A9D4F5"
@@ -1951,9 +1951,82 @@ def loan_message(
     )
 
 
-def whatsapp_link(phone, message):
+def repayment_message(
+    member_name,
+    amount_remaining,
+    due_date,
+    amount_paid=0
+):
+    """Message prérempli pour rappeler un remboursement d'échéance."""
+    amount_remaining = max(float(amount_remaining or 0), 0)
+    amount_paid = max(float(amount_paid or 0), 0)
 
-    phone = normalize_phone(phone)
+    if amount_paid > 0:
+        intro = (
+            f"Un montant de {money(amount_paid)} a déjà été enregistré "
+            f"pour cette échéance."
+        )
+    else:
+        intro = "Aucun remboursement n'a encore été enregistré pour cette échéance."
+
+    return (
+        f"Bonjour {member_name}\\n\\n"
+        f"Petit rappel concernant votre remboursement.\\n"
+        f"L'échéance prévue le {due_date.strftime('%d/%m/%Y')} "
+        f"présente un reste à payer de {money(amount_remaining)}.\\n"
+        f"{intro}\\n\\n"
+        f"Merci d'effectuer votre remboursement dès que possible.\\n\\n"
+        f"Cordialement,\\n"
+        f"{ADMIN_NAME}\\n"
+        f"Épargne Étudiant"
+    )
+
+
+def remark_message(member_name, remark):
+    """Message prérempli pour transmettre une remarque personnalisée."""
+    remark = str(remark or "").strip()
+    if not remark:
+        remark = "Nous souhaitons vous transmettre une remarque concernant votre compte."
+
+    return (
+        f"Bonjour {member_name}\\n\\n"
+        f"📌 Remarque concernant votre compte Épargne Étudiant :\\n"
+        f"{remark}\\n\\n"
+        f"Merci de votre attention.\\n\\n"
+        f"Cordialement,\\n"
+        f"{ADMIN_NAME}\\n"
+        f"Épargne Étudiant"
+    )
+
+
+def member_installments_for_reminder(member_id):
+    """Récupère les échéances d'un membre pour préparer un rappel de remboursement."""
+    it = 'public.loan_installments' if use_supabase() else 'loan_installments'
+    lt = 'public.loans' if use_supabase() else 'loans'
+
+    return read_sql(
+        f"""
+        SELECT
+            i.id,
+            i.loan_id,
+            i.installment_number,
+            i.due_date,
+            i.amount_due,
+            i.amount_paid,
+            i.payment_date,
+            i.note,
+            l.principal,
+            l.status AS loan_status
+        FROM {it} i
+        JOIN {lt} l ON l.id=i.loan_id
+        WHERE l.member_id=?
+        ORDER BY i.due_date, i.id
+        """,
+        [int(member_id)]
+    )
+
+
+def whatsapp_link(phone, message):
 
     return (
         "https://wa.me/"
@@ -3180,7 +3253,7 @@ elif page == "Cotisations":
         )
         st.info(
             "Si le membre apparaît dans Supabase mais pas ici, utilisez "
-            "« 🔄 Actualiser les données » dans la barre latérale. "
+            "« 🔄 Actualiser les données » dans la barre supérieure. "
             "Les membres avec active = TRUE ou NULL sont considérés comme actifs."
         )
 
@@ -3279,7 +3352,7 @@ elif page == "Emprunts":
         )
         st.info(
             "Si le membre apparaît dans Supabase mais pas ici, utilisez "
-            "« 🔄 Actualiser les données » dans la barre latérale. "
+            "« 🔄 Actualiser les données » dans la barre supérieure. "
             "Les membres avec active = TRUE ou NULL sont considérés comme actifs."
         )
 
@@ -3473,103 +3546,216 @@ elif page == "Emprunts":
 
 elif page == "Rappels WhatsApp":
 
-    brand_hero("Rappels WhatsApp", "Des messages simples pour garder le groupe régulier et organisé.", compact=True)
+    brand_hero(
+        "Rappels WhatsApp",
+        "Préparez rapidement des messages de cotisation, de remboursement ou des remarques personnalisées.",
+        compact=True,
+    )
 
     st.info(
         f"Numéro administratif configuré : +{WHATSAPP}"
     )
 
-    st.subheader(
-        "Rappel mensuel du 8"
-    )
+    st.subheader("📅 Rappel mensuel des cotisations")
 
     st.write(
-        "Le programme automatique peut être lancé "
-        "le 8 de chaque mois afin d'envoyer un "
-        "message privé à chaque membre."
+        "Le rappel automatique peut être lancé le 8 de chaque mois "
+        "afin d'envoyer le message de cotisation aux membres."
     )
 
     if date.today().day == 8:
         st.success(
-            "Nous sommes le 8 : c'est la journée prévue "
-            "pour les rappels mensuels."
+            "Nous sommes le 8 : c'est la journée prévue pour les rappels mensuels."
         )
 
-    st.subheader(
-        "Envoyer maintenant à tous les membres"
-    )
-
-    if st.button(
-        "📨 Envoyer les rappels maintenant"
-    ):
-
+    if st.button("📨 Envoyer les rappels de cotisation maintenant"):
         try:
-
             results = send_monthly_reminders()
-
             st.dataframe(
                 results,
                 use_container_width=True,
                 hide_index=True
             )
-
         except Exception as exc:
-
             st.error(str(exc))
 
     st.divider()
 
-    st.subheader(
-        "Messages WhatsApp préremplis"
+    st.subheader("💬 Messages WhatsApp préremplis")
+    st.caption(
+        "Choisissez un membre et le type de message. Le texte est généré automatiquement "
+        "et reste modifiable avant l'ouverture de WhatsApp."
     )
 
     mdf = get_members(True)
 
-    if not mdf.empty:
-
+    if mdf.empty:
+        st.info("Aucun membre actif disponible.")
+    else:
         options = {}
         for _, r in mdf.iterrows():
             member_id = safe_int_id(r.get("id"))
             name = str(r.get("full_name") or "").strip()
             if member_id is None or not name:
                 continue
+
             phone = normalize_phone(r.get("phone"))
             label = f"{name} — +{phone}" if phone else name
             options[f"{label} · ID {member_id}"] = r
 
         if not options:
             st.info("Aucun membre actif avec un nom valide.")
-            st.stop()
-
-        selected = st.selectbox(
-            "Membre",
-            list(options.keys()),
-            key="whatsapp_member_select"
-        )
-
-        member = options.get(selected)
-        if member is None:
-            st.warning("Le membre sélectionné n'est plus disponible. Actualisez la page.")
-            st.stop()
-
-        message = contribution_message(
-            member["full_name"]
-        )
-
-        st.text_area(
-            "Message",
-            value=message,
-            height=180,
-            key="whatsapp_preview"
-        )
-
-        st.link_button(
-            "💬 Ouvrir WhatsApp avec le message",
-            whatsapp_link(
-                member["phone"],
-                message
+        else:
+            selected = st.selectbox(
+                "Membre",
+                list(options.keys()),
+                key="whatsapp_member_select"
             )
-        )
+
+            member = options.get(selected)
+
+            if member is not None:
+                member_id = safe_int_id(member.get("id"))
+                member_name = str(member.get("full_name") or "").strip()
+                member_phone = member.get("phone")
+
+                message_type = st.selectbox(
+                    "Type de message",
+                    [
+                        "💰 Rappel de cotisation",
+                        "💳 Rappel de remboursement",
+                        "📌 Remarque personnalisée",
+                    ],
+                    key="whatsapp_message_type",
+                )
+
+                message = ""
+
+                if message_type == "💰 Rappel de cotisation":
+                    message = contribution_message(member_name)
+
+                elif message_type == "💳 Rappel de remboursement":
+                    idf = member_installments_for_reminder(member_id)
+
+                    if idf.empty:
+                        st.warning(
+                            "Ce membre n'a aucune échéance enregistrée. "
+                            "Créez d'abord un emprunt avec ses échéances."
+                        )
+                    else:
+                        installment_options = {}
+
+                        for _, r in idf.iterrows():
+                            rid = safe_int_id(r.get("id"))
+                            if rid is None:
+                                continue
+
+                            due = float(r.get("amount_due") or 0)
+                            paid = float(r.get("amount_paid") or 0)
+                            remaining = max(due - paid, 0)
+
+                            try:
+                                raw_due_date = r.get("due_date")
+                                due_date = (
+                                    raw_due_date
+                                    if isinstance(raw_due_date, date)
+                                    else date.fromisoformat(str(raw_due_date)[:10])
+                                )
+                                due_label = due_date.strftime("%d/%m/%Y")
+                            except Exception:
+                                due_date = date.today()
+                                due_label = str(r.get("due_date") or "")
+
+                            status_label = (
+                                "✓ Soldée"
+                                if remaining <= 0.01
+                                else f"Reste {money(remaining)}"
+                            )
+
+                            installment_options[
+                                f"Échéance #{r.get('installment_number')} — {due_label} — {status_label}"
+                            ] = {
+                                "id": rid,
+                                "due_date": due_date,
+                                "amount_due": due,
+                                "amount_paid": paid,
+                                "remaining": remaining,
+                            }
+
+                        if installment_options:
+                            selected_installment = st.selectbox(
+                                "Échéance à rappeler",
+                                list(installment_options.keys()),
+                                key="whatsapp_installment_select",
+                            )
+
+                            installment = installment_options[selected_installment]
+
+                            if installment["remaining"] <= 0.01:
+                                st.info(
+                                    "Cette échéance est déjà soldée. "
+                                    "Vous pouvez tout de même modifier le message ci-dessous."
+                                )
+
+                            message = repayment_message(
+                                member_name,
+                                installment["remaining"],
+                                installment["due_date"],
+                                installment["amount_paid"],
+                            )
+
+                elif message_type == "📌 Remarque personnalisée":
+                    remark = st.text_area(
+                        "Remarque à transmettre",
+                        placeholder="Ex. Merci de régulariser votre situation avant la fin du mois.",
+                        height=120,
+                        key=f"whatsapp_remark_{member_id}",
+                    )
+
+                    message = remark_message(
+                        member_name,
+                        remark,
+                    )
+
+                if message:
+                    preview_key = f"whatsapp_preview_{member_id}_{message_type}"
+
+                    st.text_area(
+                        "Message prérempli — vous pouvez le modifier",
+                        value=message,
+                        height=220,
+                        key=preview_key,
+                    )
+
+                    # On récupère la version éventuellement modifiée par l'utilisateur.
+                    final_message = st.session_state.get(preview_key, message)
+
+                    st.link_button(
+                        "💬 Ouvrir WhatsApp avec le message",
+                        whatsapp_link(
+                            member_phone,
+                            final_message,
+                        ),
+                    )
+
+                    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and Client is not None:
+                        if st.button(
+                            "📤 Envoyer directement via WhatsApp",
+                            key=f"whatsapp_direct_send_{member_id}_{message_type}",
+                        ):
+                            try:
+                                sent = send_whatsapp(member_phone, final_message)
+                                st.success(
+                                    f"Message envoyé à {member_name}. "
+                                    f"SID : {getattr(sent, 'sid', '')}"
+                                )
+                            except Exception as exc:
+                                st.error(str(exc))
+                    else:
+                        st.caption(
+                            "ℹ️ L'envoi direct automatique nécessite la configuration Twilio. "
+                            "Le bouton « Ouvrir WhatsApp » reste disponible sans Twilio."
+                        )
 
 
 # ============================================================
