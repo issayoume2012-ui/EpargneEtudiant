@@ -144,7 +144,16 @@ def inject_brand_css():
         /* Masque la barre d'outils Streamlit (Share, GitHub, Edit, etc.) dans l'application. */
         [data-testid="stToolbar"],
         [data-testid="stDecoration"],
-        [data-testid="stStatusWidget"] {{
+        [data-testid="stStatusWidget"],
+        [data-testid="stAppDeployButton"] {{
+            display: none !important;
+            visibility: hidden !important;
+        }}
+
+        /* Masque le bouton « Gérer l'application » selon les versions de Streamlit. */
+        button[kind="headerNoPadding"],
+        [data-testid="stAppDeployButton"],
+        [data-testid="stDeployButton"] {{
             display: none !important;
             visibility: hidden !important;
         }}
