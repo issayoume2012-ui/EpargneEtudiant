@@ -751,6 +751,17 @@ def migrate_database(con):
             "whatsapp_sent": "INTEGER DEFAULT 0",
             "created_at": "TEXT",
         },
+        "member_access_requests": {
+            "member_id": "INTEGER",
+            "submitted_name": "TEXT",
+            "submitted_phone": "TEXT",
+            "submitted_username": "TEXT",
+            "reason": "TEXT",
+            "status": "TEXT DEFAULT 'En attente'",
+            "admin_note": "TEXT",
+            "created_at": "TEXT",
+            "resolved_at": "TEXT",
+        },
     }
 
     for table, fields in specs.items():
@@ -905,6 +916,20 @@ def create_supabase_schema():
                 due_date DATE,
                 whatsapp_sent BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS public.member_access_requests (
+                id BIGSERIAL PRIMARY KEY,
+                member_id BIGINT REFERENCES public.members(id) ON DELETE SET NULL,
+                submitted_name TEXT NOT NULL,
+                submitted_phone TEXT,
+                submitted_username TEXT,
+                reason TEXT,
+                status TEXT NOT NULL DEFAULT 'En attente',
+                admin_note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                resolved_at TIMESTAMPTZ
             )
             """,
         ]
@@ -1138,6 +1163,12 @@ def ensure_communication_schema():
             id BIGSERIAL PRIMARY KEY, member_id BIGINT NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
             reminder_type TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, due_date DATE,
             whatsapp_sent BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS public.member_access_requests (
+            id BIGSERIAL PRIMARY KEY, member_id BIGINT REFERENCES public.members(id) ON DELETE SET NULL,
+            submitted_name TEXT NOT NULL, submitted_phone TEXT, submitted_username TEXT, reason TEXT,
+            status TEXT NOT NULL DEFAULT 'En attente', admin_note TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), resolved_at TIMESTAMPTZ
         )""")
         con.commit()
 
@@ -1469,6 +1500,149 @@ def set_member_login(member_id, username, password, active=True):
         con.commit()
 
 
+def change_member_credentials(member_id, current_password, new_username, new_password):
+    """Permet à un membre déjà authentifié de changer lui-même son accès."""
+    member_id = safe_int_id(member_id)
+    current_password = str(current_password or "")
+    new_username = str(new_username or "").strip()
+    new_password = str(new_password or "").strip()
+    if member_id is None:
+        raise ValueError("Compte membre invalide.")
+    if not current_password:
+        raise ValueError("Saisissez votre mot de passe actuel pour confirmer votre identité.")
+    if not new_username or not new_password:
+        raise ValueError("Le nouvel identifiant et le nouveau mot de passe sont obligatoires.")
+    if len(new_password) < 4:
+        raise ValueError("Le nouveau mot de passe doit contenir au moins 4 caractères.")
+
+    with db() as con:
+        current = con.execute(
+            "SELECT id, member_username, member_password FROM members WHERE id=? AND active=TRUE LIMIT 1",
+            (member_id,),
+        ).fetchone()
+        if not current:
+            raise ValueError("Compte membre introuvable ou désactivé.")
+        if str(current["member_password"] or "") != current_password:
+            raise ValueError("Le mot de passe actuel est incorrect.")
+        other = con.execute(
+            "SELECT id FROM members WHERE lower(member_username)=lower(?) AND id<>? LIMIT 1",
+            (new_username, member_id),
+        ).fetchone()
+        if other:
+            raise ValueError("Cet identifiant est déjà utilisé par un autre membre.")
+        con.execute(
+            """UPDATE members
+               SET member_username=?, member_password=?, member_login_active=TRUE
+               WHERE id=?""",
+            (new_username, new_password, member_id),
+        )
+        con.commit()
+    try:
+        member_account_data_cached.clear()
+    except Exception:
+        pass
+
+
+def create_member_access_request(submitted_name, submitted_phone="", submitted_username="", reason=""):
+    """Enregistre une demande de récupération d'accès sans révéler le mot de passe."""
+    name = str(submitted_name or "").strip()
+    phone = str(submitted_phone or "").strip()
+    username = str(submitted_username or "").strip()
+    reason = str(reason or "").strip()
+    if not name:
+        raise ValueError("Votre nom complet est obligatoire pour la demande.")
+    table = _table("member_access_requests")
+    mt = _table("members")
+    with db() as con:
+        member = None
+        if username:
+            member = con.execute(
+                f"SELECT id FROM {mt} WHERE lower(member_username)=lower(?) AND active=TRUE LIMIT 1",
+                (username,),
+            ).fetchone()
+        if member is None and phone:
+            matches = con.execute(
+                f"SELECT id FROM {mt} WHERE phone=? AND active=TRUE",
+                (phone,),
+            ).fetchall()
+            if len(matches) == 1:
+                member = matches[0]
+        if member is None:
+            matches = con.execute(
+                f"SELECT id FROM {mt} WHERE lower(trim(full_name))=lower(trim(?)) AND active=TRUE",
+                (name,),
+            ).fetchall()
+            if len(matches) == 1:
+                member = matches[0]
+        # Si plusieurs personnes correspondent au nom/téléphone, on ne
+        # rattache pas automatiquement la demande : l'administrateur
+        # devra identifier le bon membre avant de réinitialiser l'accès.
+        member_id = safe_int_id(member["id"]) if member else None
+        con.execute(
+            f"""INSERT INTO {table}
+                (member_id, submitted_name, submitted_phone, submitted_username, reason, status)
+                VALUES (?, ?, ?, ?, ?, 'En attente')""",
+            (member_id, name, phone or None, username or None, reason or None),
+        )
+        con.commit()
+
+
+def get_member_access_requests(pending_only=False):
+    table = _table("member_access_requests")
+    mt = _table("members")
+    query = f"""
+        SELECT ar.id, ar.member_id, COALESCE(m.full_name, ar.submitted_name) AS member_name,
+               m.phone AS registered_phone, ar.submitted_name, ar.submitted_phone,
+               ar.submitted_username, ar.reason, ar.status, ar.admin_note,
+               ar.created_at, ar.resolved_at
+        FROM {table} ar
+        LEFT JOIN {mt} m ON m.id=ar.member_id
+    """
+    if pending_only:
+        query += " WHERE ar.status='En attente'"
+    query += " ORDER BY ar.created_at DESC, ar.id DESC"
+    return read_sql(query)
+
+
+def resolve_member_access_request(request_id, member_id, new_username, new_password, admin_note=""):
+    """L'administrateur définit de nouveaux identifiants et clôture la demande."""
+    request_id = safe_int_id(request_id)
+    member_id = safe_int_id(member_id)
+    new_username = str(new_username or "").strip()
+    new_password = str(new_password or "").strip()
+    admin_note = str(admin_note or "").strip()
+    if request_id is None or member_id is None:
+        raise ValueError("Demande ou membre invalide.")
+    if not new_username or not new_password:
+        raise ValueError("Le nouvel identifiant et le nouveau mot de passe sont obligatoires.")
+    if len(new_password) < 4:
+        raise ValueError("Le nouveau mot de passe doit contenir au moins 4 caractères.")
+    with db() as con:
+        other = con.execute(
+            "SELECT id FROM members WHERE lower(member_username)=lower(?) AND id<>? LIMIT 1",
+            (new_username, member_id),
+        ).fetchone()
+        if other:
+            raise ValueError("Cet identifiant est déjà utilisé par un autre membre.")
+        con.execute(
+            """UPDATE members
+               SET member_username=?, member_password=?, member_login_active=TRUE
+               WHERE id=?""",
+            (new_username, new_password, member_id),
+        )
+        con.execute(
+            """UPDATE member_access_requests
+               SET status='Résolue', admin_note=?, resolved_at=CURRENT_TIMESTAMP, member_id=?
+               WHERE id=?""",
+            (admin_note or None, member_id, request_id),
+        )
+        con.commit()
+    try:
+        member_account_data_cached.clear()
+    except Exception:
+        pass
+
+
 def get_member_login_status():
     return read_sql(
         """
@@ -1530,9 +1704,10 @@ def member_account_page(member_id):
     messages = get_member_messages(member_id)
     votes = loan_votes_for_member(member_id)
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "💰 Mes cotisations", "💳 Mes emprunts", "📅 Mes échéances",
-        "🔔 Mes rappels", "💬 Messages & réclamations", "🗳️ Votes / droit de veto"
+        "🔔 Mes rappels", "💬 Messages & réclamations", "🗳️ Votes / droit de veto",
+        "🔐 Mon accès"
     ])
     with tab1:
         st.dataframe(data["contributions"], use_container_width=True, hide_index=True)
@@ -1639,6 +1814,31 @@ def member_account_page(member_id):
                         st.write(f"{icon} Votre vote : **{current}**")
                         if r.get("comment"):
                             st.caption(f"Commentaire : {r['comment']}")
+
+
+    with tab7:
+        st.subheader("🔐 Modifier mes identifiants")
+        st.info("Pour changer vous-même votre accès, vous devez d'abord confirmer votre mot de passe actuel. Votre nouvel identifiant doit être unique.")
+        current_username = str(data["member"].iloc[0].get("member_username") or "")
+        st.caption(f"Identifiant actuel : **{current_username or 'non défini'}**")
+        with st.form("member_change_credentials_form"):
+            current_password = st.text_input("Mot de passe actuel", type="password", key="member_current_password")
+            new_username = st.text_input("Nouvel identifiant", value=current_username, key="member_new_username")
+            new_password = st.text_input("Nouveau mot de passe", type="password", key="member_new_password")
+            confirm_password = st.text_input("Confirmer le nouveau mot de passe", type="password", key="member_confirm_password")
+            change_access = st.form_submit_button("🔒 Enregistrer mon nouvel accès", type="primary")
+            if change_access:
+                if new_password != confirm_password:
+                    st.error("Les deux nouveaux mots de passe ne correspondent pas.")
+                else:
+                    try:
+                        change_member_credentials(member_id, current_password, new_username, new_password)
+                        st.session_state.user["member_username"] = new_username.strip()
+                        st.success("Votre identifiant et votre mot de passe ont été modifiés avec succès.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
 
 
 # ============================================================
@@ -3545,6 +3745,21 @@ if st.session_state.user is None:
                     else:
                         st.error("Identifiant ou mot de passe membre incorrect, ou compte désactivé.")
 
+            with st.expander("🆘 Accès oublié ? Signaler le problème à l'administrateur"):
+                st.caption("Si vous ne pouvez plus vous connecter, indiquez vos informations d'identification. L'administrateur vérifiera votre identité et pourra définir un nouvel accès et un nouveau mot de passe.")
+                with st.form("member_access_recovery_form", clear_on_submit=True):
+                    recovery_name = st.text_input("Nom complet", key="recovery_name")
+                    recovery_phone = st.text_input("Numéro de téléphone / WhatsApp", key="recovery_phone")
+                    recovery_username = st.text_input("Ancien identifiant (si vous vous en souvenez)", key="recovery_username")
+                    recovery_reason = st.text_area("Message à l'administrateur", placeholder="Ex. : j'ai oublié mon mot de passe...", key="recovery_reason")
+                    recovery_submit = st.form_submit_button("📨 Signaler l'oubli", use_container_width=True)
+                    if recovery_submit:
+                        try:
+                            create_member_access_request(recovery_name, recovery_phone, recovery_username, recovery_reason)
+                            st.success("Votre demande a été transmise à l'administrateur. Il pourra vérifier votre identité puis définir de nouveaux identifiants.")
+                        except Exception as exc:
+                            st.error(str(exc))
+
         st.markdown(
             '<div class="info-card">🔒 Vos données d’épargne, de cotisations et de prêts sont enregistrées dans la base configurée par l’administrateur.</div>',
             unsafe_allow_html=True,
@@ -4539,3 +4754,54 @@ elif page == "Administrateurs":
             status_df = status_df[["id", "Membre", "phone", "Identifiant", "État"]]
             status_df = status_df.rename(columns={"id": "ID", "phone": "Téléphone"})
             st.dataframe(status_df, use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.subheader("🆘 Demandes d'accès oublié")
+            st.caption("Un membre qui ne peut plus se connecter peut signaler son oubli depuis la page d'accueil. Après vérification de son identité, vous pouvez définir ici un nouvel identifiant et un nouveau mot de passe.")
+            pending_requests = get_member_access_requests(pending_only=True)
+            if pending_requests.empty:
+                st.success("Aucune demande d'accès en attente.")
+            else:
+                st.dataframe(
+                    pending_requests[["id", "member_name", "submitted_phone", "submitted_username", "reason", "created_at"]].rename(columns={
+                        "id": "ID", "member_name": "Membre", "submitted_phone": "Téléphone fourni",
+                        "submitted_username": "Ancien identifiant", "reason": "Message", "created_at": "Date"
+                    }),
+                    use_container_width=True, hide_index=True
+                )
+                request_options = {
+                    f"#{safe_int_id(r['id'])} — {r['member_name']} — {r['created_at']}": safe_int_id(r['id'])
+                    for _, r in pending_requests.iterrows() if safe_int_id(r.get('id')) is not None
+                }
+                if request_options:
+                    selected_request_label = st.selectbox("Demande à traiter", list(request_options.keys()), key="member_access_request_select")
+                    selected_request_id = request_options[selected_request_label]
+                    req_row = pending_requests[pending_requests["id"].map(safe_int_id) == selected_request_id].iloc[0]
+                    linked_member_id = safe_int_id(req_row.get("member_id"))
+                    if linked_member_id is None:
+                        st.warning("La demande n'a pas été automatiquement reliée à un membre. Sélectionnez le membre après vérification de son identité.")
+                        member_reset_options = build_member_options(members_df, include_phone=False)
+                        reset_selected_label = st.selectbox("Membre vérifié", list(member_reset_options.keys()), key="recovery_member_select")
+                        linked_member_id = member_reset_options.get(reset_selected_label)
+                    else:
+                        linked_row = members_df[members_df["id"] == linked_member_id]
+                        linked_name = str(linked_row.iloc[0]["full_name"]) if not linked_row.empty else str(req_row.get("member_name") or "")
+                        st.info(f"Membre identifié : **{linked_name}**")
+                    with st.form("member_access_reset_form"):
+                        reset_username = st.text_input("Nouvel identifiant", placeholder="Ex. prenom.nom")
+                        reset_password = st.text_input("Nouveau mot de passe", type="password")
+                        reset_password_confirm = st.text_input("Confirmer le mot de passe", type="password")
+                        reset_note = st.text_area("Note de résolution (facultatif)", placeholder="Ex. Identité vérifiée par téléphone.")
+                        resolve_request = st.form_submit_button("🔑 Définir le nouvel accès et clôturer la demande", type="primary")
+                        if resolve_request:
+                            if reset_password != reset_password_confirm:
+                                st.error("Les deux mots de passe ne correspondent pas.")
+                            elif linked_member_id is None:
+                                st.error("Sélectionnez un membre vérifié avant de poursuivre.")
+                            else:
+                                try:
+                                    resolve_member_access_request(selected_request_id, linked_member_id, reset_username, reset_password, reset_note)
+                                    st.success("Nouveaux identifiants enregistrés et demande clôturée. Le membre pourra se reconnecter avec cet accès.")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(str(exc))
