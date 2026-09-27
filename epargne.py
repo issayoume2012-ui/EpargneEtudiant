@@ -2,13 +2,7 @@ import os
 import sqlite3
 import base64
 import mimetypes
-import hashlib
-import hmac
-import html
-import logging
-import re
-import secrets
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
@@ -40,36 +34,21 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 
 DB_PATH = Path("epargne_etudiant.db")
 
+ADMIN_NAME = "Abdou Latif ALD"
+ADMIN_USERNAME = "iy@2012"
+ADMIN_PASSWORD = "issayoume2026"
+
 WHATSAPP = "777521969"
 COUNTRY_CODE = "221"
 CURRENCY = "FCFA"
 
 def secret_or_env(name, default=""):
-    """
-    Lit un secret de façon robuste.
-
-    Streamlit recommande de placer les secrets à la racine de secrets.toml.
-    Pour rester compatible avec une configuration où l'utilisateur aurait
-    accidentellement placé certains secrets dans une section TOML (par ex.
-    [browser]), on recherche également dans les sections existantes.
-    Les variables d'environnement restent le dernier recours.
-    """
+    """Lit d'abord Streamlit Secrets, puis les variables d'environnement."""
     try:
         value = st.secrets.get(name, "")
-        if value not in (None, ""):
-            return value
-        for section_name in ("app", "security", "browser", "server", "admin", "postgres"):
-            try:
-                section = st.secrets.get(section_name, {})
-                if hasattr(section, "get"):
-                    nested = section.get(name, "")
-                    if nested not in (None, ""):
-                        return nested
-            except Exception:
-                continue
     except Exception:
-        pass
-    return os.getenv(name, default)
+        value = ""
+    return value or os.getenv(name, default)
 
 
 # Configuration Supabase / PostgreSQL.
@@ -87,143 +66,6 @@ def postgres_secret(name, default=""):
     except Exception:
         pass
     return secret_or_env(name, default)
-
-ADMIN_NAME = secret_or_env("ADMIN_INITIAL_NAME", "Administrateur")
-ADMIN_USERNAME = secret_or_env("ADMIN_INITIAL_USERNAME", "")
-ADMIN_PASSWORD = secret_or_env("ADMIN_INITIAL_PASSWORD", "")
-# Réinitialisation volontaire et ponctuelle du compte administrateur.
-# Mettre ADMIN_FORCE_RESET=true uniquement pour récupérer un compte existant,
-# redéployer une fois, puis remettre immédiatement la valeur à false/supprimer.
-ADMIN_FORCE_RESET = str(secret_or_env("ADMIN_FORCE_RESET", "0")).strip().lower() in {"1", "true", "yes", "oui"}
-AUTH_TIMEOUT_MINUTES = int(secret_or_env("AUTH_TIMEOUT_MINUTES", "30") or 30)
-MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
-MAX_PASSWORD_LENGTH = 256
-PASSWORD_MIN_LENGTH = 10
-LOGIN_MAX_ATTEMPTS = 5
-LOGIN_LOCK_MINUTES = 15
-
-# ============================================================
-# SÉCURITÉ : MOTS DE PASSE, SESSIONS ET ERREURS
-# ============================================================
-
-PBKDF2_ITERATIONS = 600_000
-PASSWORD_ALGORITHM = "pbkdf2_sha256"
-
-
-def hash_password(password):
-    """Hash PBKDF2-SHA256 avec sel aléatoire."""
-    password = str(password or "")
-    if not password:
-        raise ValueError("Le mot de passe ne peut pas être vide.")
-    salt = secrets.token_bytes(32)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
-    return f"{PASSWORD_ALGORITHM}${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
-
-
-def verify_password(password, stored_value):
-    """Vérifie un hash moderne et migre temporairement les anciens mots de passe en clair."""
-    password = str(password or "")
-    stored = str(stored_value or "")
-    if not password or not stored:
-        return False, False
-    parts = stored.split("$")
-    if len(parts) == 4 and parts[0] == PASSWORD_ALGORITHM:
-        try:
-            iterations = int(parts[1])
-            salt = bytes.fromhex(parts[2])
-            expected = bytes.fromhex(parts[3])
-            if iterations < 100_000 or len(salt) < 16:
-                return False, False
-            actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-            return hmac.compare_digest(actual, expected), False
-        except (ValueError, TypeError):
-            return False, False
-    return hmac.compare_digest(stored, password), True
-
-
-def validate_password(password, label="Le mot de passe"):
-    password = str(password or "")
-    if len(password) < PASSWORD_MIN_LENGTH:
-        raise ValueError(f"{label} doit contenir au moins {PASSWORD_MIN_LENGTH} caractères.")
-    if len(password) > MAX_PASSWORD_LENGTH:
-        raise ValueError(f"{label} est trop long.")
-    if any(ch.isspace() for ch in password):
-        raise ValueError(f"{label} ne doit pas contenir d'espace.")
-    classes = sum(bool(re.search(pattern, password)) for pattern in (r"[a-z]", r"[A-Z]", r"\d", r"[^A-Za-z0-9]"))
-    if classes < 3:
-        raise ValueError(f"{label} doit combiner au moins 3 catégories parmi minuscules, majuscules, chiffres et caractères spéciaux.")
-    return password
-
-
-def sanitize_filename(filename):
-    name = Path(str(filename or "piece_jointe")).name
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
-    return (name[:120] or "piece_jointe")
-
-
-def validate_attachment(filename, mime, data):
-    if data is None:
-        return None
-    if not isinstance(data, (bytes, bytearray, memoryview)):
-        raise ValueError("La pièce jointe est invalide.")
-    raw = bytes(data)
-    if not raw:
-        raise ValueError("La pièce jointe est vide.")
-    if len(raw) > MAX_ATTACHMENT_BYTES:
-        raise ValueError("La pièce jointe ne doit pas dépasser 10 Mo.")
-    safe_name = sanitize_filename(filename)
-    ext = Path(safe_name).suffix.lower()
-    allowed = {".png", ".jpg", ".jpeg", ".webp", ".pdf", ".doc", ".docx"}
-    if ext not in allowed:
-        raise ValueError("Type de pièce jointe non autorisé.")
-    signatures = {
-        ".png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
-        ".jpg": raw.startswith(b"\xff\xd8\xff"),
-        ".jpeg": raw.startswith(b"\xff\xd8\xff"),
-        ".webp": raw.startswith(b"RIFF") and raw[8:12] == b"WEBP",
-        ".pdf": raw.startswith(b"%PDF-"),
-        ".doc": raw.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"),
-        ".docx": raw.startswith(b"PK\x03\x04"),
-    }
-    if not signatures.get(ext, False):
-        raise ValueError("Le contenu de la pièce jointe ne correspond pas à son extension.")
-    return safe_name
-
-
-def show_app_exception(exc, fallback="Une erreur interne est survenue. Réessayez."):
-    """N'expose pas les détails SQL/connexion aux utilisateurs."""
-    if isinstance(exc, ValueError):
-        st.error(str(exc))
-    else:
-        logging.exception("Erreur applicative", exc_info=exc)
-        st.error(fallback)
-
-
-def utc_now():
-    return datetime.now(timezone.utc)
-
-
-def parse_datetime_safe(value):
-    if value in (None, ""):
-        return None
-    if isinstance(value, datetime):
-        dt = value
-    else:
-        try:
-            dt = pd.to_datetime(value, errors="coerce").to_pydatetime()
-        except Exception:
-            return None
-    if dt is None or pd.isna(dt):
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def login_is_locked(row):
-    value = row.get("locked_until") if isinstance(row, dict) else row["locked_until"]
-    locked_until = parse_datetime_safe(value)
-    return bool(locked_until and locked_until > utc_now())
 
 SUPABASE_DB_URL = secret_or_env("SUPABASE_DB_URL", "")
 SUPABASE_HOST = postgres_secret("host", "") or secret_or_env("SUPABASE_HOST", "")
@@ -837,11 +679,6 @@ def migrate_database(con):
         return {row["name"] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
 
     specs = {
-        "admins": {
-            "failed_login_attempts": "INTEGER DEFAULT 0",
-            "locked_until": "TEXT",
-            "credential_version": "INTEGER DEFAULT 1",
-        },
         "members": {
             "phone": "TEXT",
             "monthly_target": "REAL DEFAULT 0",
@@ -850,9 +687,6 @@ def migrate_database(con):
             "member_username": "TEXT",
             "member_password": "TEXT",
             "member_login_active": "INTEGER DEFAULT 0",
-            "failed_login_attempts": "INTEGER DEFAULT 0",
-            "locked_until": "TEXT",
-            "credential_version": "INTEGER DEFAULT 1",
             "created_at": "TEXT",
         },
         "contributions": {
@@ -986,9 +820,6 @@ def create_supabase_schema():
                 password TEXT NOT NULL,
                 full_name TEXT NOT NULL,
                 active BOOLEAN NOT NULL DEFAULT TRUE,
-                failed_login_attempts INTEGER NOT NULL DEFAULT 0,
-                locked_until TIMESTAMPTZ,
-                credential_version BIGINT NOT NULL DEFAULT 1,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """,
@@ -1003,9 +834,6 @@ def create_supabase_schema():
                 member_username TEXT UNIQUE,
                 member_password TEXT,
                 member_login_active BOOLEAN NOT NULL DEFAULT FALSE,
-                failed_login_attempts INTEGER NOT NULL DEFAULT 0,
-                locked_until TIMESTAMPTZ,
-                credential_version BIGINT NOT NULL DEFAULT 1,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """,
@@ -1114,11 +942,6 @@ def create_supabase_schema():
         # IMPORTANT : les colonnes sont ajoutées AVANT les index.
         # ------------------------------------------------------------
         alter_statements = [
-            # admins / anti-bruteforce
-            "ALTER TABLE public.admins ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE public.admins ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ",
-            "ALTER TABLE public.admins ADD COLUMN IF NOT EXISTS credential_version BIGINT NOT NULL DEFAULT 1",
-
             # members
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS full_name TEXT",
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS phone TEXT",
@@ -1128,9 +951,6 @@ def create_supabase_schema():
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS member_username TEXT",
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS member_password TEXT",
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS member_login_active BOOLEAN DEFAULT FALSE",
-            "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ",
-            "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS credential_version BIGINT NOT NULL DEFAULT 1",
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
 
             # member_messages
@@ -1246,56 +1066,14 @@ def create_supabase_schema():
         # ------------------------------------------------------------
         # 4. Administrateur initial.
         # ------------------------------------------------------------
-        if ADMIN_USERNAME and ADMIN_PASSWORD:
-            validate_password(ADMIN_PASSWORD, "ADMIN_INITIAL_PASSWORD")
-            admin_username = ADMIN_USERNAME.strip()
-            admin_name = (ADMIN_NAME or "Administrateur").strip()
-            existing_admin = cur.execute(
-                "SELECT id, username, active FROM public.admins WHERE lower(username)=lower(?) LIMIT 1",
-                (admin_username,),
-            ).fetchone()
-
-            if ADMIN_FORCE_RESET:
-                # Réinitialisation explicite et ponctuelle.
-                # Si le compte portant le nouvel identifiant n'existe pas encore,
-                # on récupère le premier compte administrateur existant. Cela évite
-                # qu'un ancien identifiant oublié bloque définitivement l'accès.
-                reset_target = existing_admin
-                if reset_target is None:
-                    reset_target = cur.execute(
-                        "SELECT id, username, active FROM public.admins ORDER BY id ASC LIMIT 1"
-                    ).fetchone()
-
-                if reset_target is not None:
-                    cur.execute(
-                        """
-                        UPDATE public.admins
-                        SET username=?, password=?, full_name=?, active=TRUE,
-                            failed_login_attempts=0, locked_until=NULL,
-                            credential_version=COALESCE(credential_version,1)+1
-                        WHERE id=?
-                        """,
-                        (admin_username, hash_password(ADMIN_PASSWORD), admin_name, reset_target["id"]),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        INSERT INTO public.admins
-                            (username, password, full_name, active, failed_login_attempts, locked_until, credential_version)
-                        VALUES (?, ?, ?, TRUE, 0, NULL, 1)
-                        """,
-                        (admin_username, hash_password(ADMIN_PASSWORD), admin_name),
-                    )
-            elif existing_admin is None:
-                cur.execute(
-                    """
-                    INSERT INTO public.admins
-                        (username, password, full_name, active, failed_login_attempts, locked_until, credential_version)
-                    VALUES (?, ?, ?, TRUE, 0, NULL, 1)
-                    ON CONFLICT (username) DO NOTHING
-                    """,
-                    (admin_username, hash_password(ADMIN_PASSWORD), admin_name),
-                )
+        cur.execute(
+            """
+            INSERT INTO public.admins (username, password, full_name)
+            VALUES (?, ?, ?)
+            ON CONFLICT (username) DO NOTHING
+            """,
+            (ADMIN_USERNAME, ADMIN_PASSWORD, ADMIN_NAME),
+        )
 
         # ------------------------------------------------------------
         # 5. Reprise des anciennes colonnes de prêts.
@@ -1683,78 +1461,55 @@ def add_months(d, months):
 # AUTHENTIFICATION
 # ============================================================
 
-def _register_failed_login(con, table, row_id):
-    row = con.execute(f"SELECT failed_login_attempts FROM {table} WHERE id=? LIMIT 1", (row_id,)).fetchone()
-    attempts = int(row_value(row, "failed_login_attempts", 0) or 0) + 1
-    if attempts >= LOGIN_MAX_ATTEMPTS:
-        locked_until = utc_now() + timedelta(minutes=LOGIN_LOCK_MINUTES)
-        con.execute(f"UPDATE {table} SET failed_login_attempts=0, locked_until=? WHERE id=?", (locked_until, row_id))
-    else:
-        con.execute(f"UPDATE {table} SET failed_login_attempts=? WHERE id=?", (attempts, row_id))
-    con.commit()
-
-
-def _clear_failed_logins(con, table, row_id):
-    con.execute(f"UPDATE {table} SET failed_login_attempts=0, locked_until=NULL WHERE id=?", (row_id,))
-    con.commit()
-
-
 def authenticate(username, password):
-    username = str(username or "").strip()
-    password = str(password or "")
-    if not username or len(password) > MAX_PASSWORD_LENGTH:
-        return None
-    table = "public.admins" if use_supabase() else "admins"
+
     with db() as con:
+
         row = con.execute(
-            f"""SELECT id, username, full_name, password, failed_login_attempts, locked_until, credential_version
-                FROM {table}
-                WHERE lower(username)=lower(?) AND active=TRUE LIMIT 1""",
-            (username,),
+            """
+            SELECT id, username, full_name
+            FROM admins
+            WHERE username=?
+              AND password=?
+              AND active=TRUE
+            """,
+            (
+                username.strip(),
+                password,
+            )
         ).fetchone()
-        if not row or login_is_locked(row):
-            return None
-        valid, legacy_plaintext = verify_password(password, row_value(row, "password"))
-        if not valid:
-            _register_failed_login(con, table, row["id"])
-            return None
-        if legacy_plaintext:
-            con.execute(f"UPDATE {table} SET password=?, credential_version=COALESCE(credential_version,1)+1 WHERE id=?", (hash_password(password), row["id"]))
-        _clear_failed_logins(con, table, row["id"])
-        return {"id": row["id"], "username": row["username"], "full_name": row["full_name"], "role": "admin", "credential_version": int(row_value(row, "credential_version") or 1) + (1 if legacy_plaintext else 0)}
+
+    return dict(row) if row else None
 
 
+# Authentification d'un membre : le compte est strictement lié à un seul membre.
 def authenticate_member(username, password):
-    username = str(username or "").strip()
-    password = str(password or "")
-    if not username or len(password) > MAX_PASSWORD_LENGTH:
-        return None
-    table = "public.members" if use_supabase() else "members"
     with db() as con:
         row = con.execute(
-            f"""SELECT id, full_name, member_username, member_password, failed_login_attempts, locked_until, credential_version
-                FROM {table}
-                WHERE lower(member_username)=lower(?) AND member_login_active=TRUE AND active=TRUE LIMIT 1""",
-            (username,),
+            """
+            SELECT id, full_name, member_username
+            FROM members
+            WHERE member_username=?
+              AND member_password=?
+              AND member_login_active=TRUE
+              AND active=TRUE
+            LIMIT 1
+            """,
+            (username.strip(), password),
         ).fetchone()
-        if not row or login_is_locked(row):
-            return None
-        valid, legacy_plaintext = verify_password(password, row_value(row, "member_password"))
-        if not valid:
-            _register_failed_login(con, table, row["id"])
-            return None
-        if legacy_plaintext:
-            con.execute(f"UPDATE {table} SET member_password=?, credential_version=COALESCE(credential_version,1)+1 WHERE id=?", (hash_password(password), row["id"]))
-        _clear_failed_logins(con, table, row["id"])
-        return {"id": row["id"], "full_name": row["full_name"], "member_username": row["member_username"], "role": "member", "member_id": row["id"], "credential_version": int(row_value(row, "credential_version") or 1) + (1 if legacy_plaintext else 0)}
+    if not row:
+        return None
+    result = dict(row)
+    result["role"] = "member"
+    result["member_id"] = result["id"]
+    return result
 
 
 def set_member_login(member_id, username, password, active=True):
     username = username.strip()
-    password = str(password or "").strip()
+    password = password.strip()
     if not username or not password:
         raise ValueError("Le nom d'utilisateur et le mot de passe du membre sont obligatoires.")
-    validate_password(password, "Le mot de passe du membre")
     with db() as con:
         # Empêche qu'un même identifiant soit attribué à deux membres.
         row = con.execute(
@@ -1766,11 +1521,10 @@ def set_member_login(member_id, username, password, active=True):
         con.execute(
             """
             UPDATE members
-            SET member_username=?, member_password=?, member_login_active=?,
-                failed_login_attempts=0, locked_until=NULL, credential_version=COALESCE(credential_version,1)+1
+            SET member_username=?, member_password=?, member_login_active=?
             WHERE id=?
             """,
-            (username, hash_password(password), bool(active), member_id),
+            (username, password, bool(active), member_id),
         )
         con.commit()
 
@@ -1787,7 +1541,8 @@ def change_member_credentials(member_id, current_password, new_username, new_pas
         raise ValueError("Saisissez votre mot de passe actuel pour confirmer votre identité.")
     if not new_username or not new_password:
         raise ValueError("Le nouvel identifiant et le nouveau mot de passe sont obligatoires.")
-    validate_password(new_password, "Le nouveau mot de passe")
+    if len(new_password) < 4:
+        raise ValueError("Le nouveau mot de passe doit contenir au moins 4 caractères.")
 
     with db() as con:
         current = con.execute(
@@ -1796,8 +1551,7 @@ def change_member_credentials(member_id, current_password, new_username, new_pas
         ).fetchone()
         if not current:
             raise ValueError("Compte membre introuvable ou désactivé.")
-        valid, _legacy = verify_password(current_password, row_value(current, "member_password"))
-        if not valid:
+        if str(current["member_password"] or "") != current_password:
             raise ValueError("Le mot de passe actuel est incorrect.")
         other = con.execute(
             "SELECT id FROM members WHERE lower(member_username)=lower(?) AND id<>? LIMIT 1",
@@ -1807,10 +1561,9 @@ def change_member_credentials(member_id, current_password, new_username, new_pas
             raise ValueError("Cet identifiant est déjà utilisé par un autre membre.")
         con.execute(
             """UPDATE members
-               SET member_username=?, member_password=?, member_login_active=TRUE,
-                   failed_login_attempts=0, locked_until=NULL, credential_version=COALESCE(credential_version,1)+1
+               SET member_username=?, member_password=?, member_login_active=TRUE
                WHERE id=?""",
-            (new_username, hash_password(new_password), member_id),
+            (new_username, new_password, member_id),
         )
         con.commit()
     try:
@@ -1894,7 +1647,8 @@ def resolve_member_access_request(request_id, member_id, new_username, new_passw
         raise ValueError("Demande ou membre invalide.")
     if not new_username or not new_password:
         raise ValueError("Le nouvel identifiant et le nouveau mot de passe sont obligatoires.")
-    validate_password(new_password, "Le nouveau mot de passe")
+    if len(new_password) < 4:
+        raise ValueError("Le nouveau mot de passe doit contenir au moins 4 caractères.")
     with db() as con:
         other = con.execute(
             "SELECT id FROM members WHERE lower(member_username)=lower(?) AND id<>? LIMIT 1",
@@ -2032,7 +1786,7 @@ def member_account_page(member_id):
                     st.success("Votre message a été transmis à l'administration.")
                     st.rerun()
                 except Exception as exc:
-                    show_app_exception(exc)
+                    st.error(str(exc))
 
         st.divider()
         st.subheader("📥 Échanges avec l'administration")
@@ -2086,7 +1840,7 @@ def member_account_page(member_id):
                                     st.success(f"Vote enregistré. Statut du prêt : {new_status}.")
                                     st.rerun()
                                 except Exception as exc:
-                                    show_app_exception(exc)
+                                    st.error(str(exc))
                     else:
                         icon = "🛑" if current == "Veto" else "✅"
                         st.write(f"{icon} Votre vote : **{current}**")
@@ -2112,12 +1866,10 @@ def member_account_page(member_id):
                     try:
                         change_member_credentials(member_id, current_password, new_username, new_password)
                         st.session_state.user["member_username"] = new_username.strip()
-                        st.session_state.user["credential_version"] = int(st.session_state.user.get("credential_version", 1) or 1) + 1
-                        st.session_state.auth_last_verified = utc_now()
                         st.success("Votre identifiant et votre mot de passe ont été modifiés avec succès.")
                         st.rerun()
                     except Exception as exc:
-                        show_app_exception(exc)
+                        st.error(str(exc))
 
 
 
@@ -2824,8 +2576,10 @@ def create_member_message(member_id, message, subject="", message_type="message"
     if member_id is None or not str(message or "").strip():
         raise ValueError("Le membre et le message sont obligatoires.")
     if attachment_data is not None:
-        attachment_name = validate_attachment(attachment_name, attachment_mime, attachment_data)
-        attachment_mime = str(attachment_mime or mimetypes.guess_type(attachment_name)[0] or "application/octet-stream")
+        if not isinstance(attachment_data, (bytes, bytearray, memoryview)):
+            raise ValueError("La pièce jointe est invalide.")
+        if len(attachment_data) > 10 * 1024 * 1024:
+            raise ValueError("La pièce jointe ne doit pas dépasser 10 Mo.")
     table = _table("member_messages")
     with db() as con:
         con.execute(
@@ -3273,44 +3027,23 @@ def get_admins():
     return read_sql(f"SELECT id,username,full_name,active,created_at FROM {table} ORDER BY full_name")
 
 
-def change_admin_password(admin_id, current_password, new_password):
-    admin_id = safe_int_id(admin_id)
-    if admin_id is None:
-        raise ValueError("Compte administrateur invalide.")
-    current_password = str(current_password or "")
-    new_password = str(new_password or "")
-    validate_password(new_password, "Le nouveau mot de passe administrateur")
-    if current_password == new_password:
-        raise ValueError("Le nouveau mot de passe doit être différent de l'ancien.")
-    table = _table("admins")
-    with db() as con:
-        row = con.execute(f"SELECT id,password FROM {table} WHERE id=? AND active=TRUE LIMIT 1", (admin_id,)).fetchone()
-        if not row:
-            raise ValueError("Compte administrateur introuvable ou désactivé.")
-        valid, _legacy = verify_password(current_password, row_value(row, "password"))
-        if not valid:
-            raise ValueError("Le mot de passe actuel est incorrect.")
-        con.execute(
-            f"UPDATE {table} SET password=?, failed_login_attempts=0, locked_until=NULL, credential_version=COALESCE(credential_version,1)+1 WHERE id=?",
-            (hash_password(new_password), admin_id),
-        )
-        con.commit()
-
-
 def add_admin(username, password, full_name):
-    username = str(username or "").strip()
-    full_name = str(full_name or "").strip()
-    if not username or not full_name:
-        raise ValueError("Le nom complet et l'identifiant sont obligatoires.")
-    validate_password(password, "Le mot de passe administrateur")
-    table = _table("admins")
+
     with db() as con:
-        existing = con.execute(f"SELECT id FROM {table} WHERE lower(username)=lower(?) LIMIT 1", (username,)).fetchone()
-        if existing:
-            raise ValueError("Cet identifiant administrateur est déjà utilisé.")
         con.execute(
-            f"INSERT INTO {table}(username,password,full_name,active,failed_login_attempts,locked_until,credential_version) VALUES (?,?,?,TRUE,0,NULL,1)",
-            (username, hash_password(password), full_name),
+            """
+            INSERT INTO admins(
+                username,
+                password,
+                full_name
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                username.strip(),
+                password,
+                full_name.strip(),
+            )
         )
         con.commit()
 
@@ -4026,31 +3759,6 @@ def generate_global_pdf():
 
 
 # ============================================================
-# INITIALISATION LÉGÈRE DES VOTES EXISTANTS
-# ============================================================
-
-@st.cache_resource(show_spinner=False)
-def bootstrap_existing_loans_once(config_fingerprint=None):
-    """Initialise les votes des anciens prêts une seule fois par processus."""
-    try:
-        ensure_loan_admin_columns()
-        existing_loans = loans()
-        for _lid in existing_loans["id"].tolist() if not existing_loans.empty else []:
-            ensure_loan_votes(_lid)
-            _vdf, _vstatus = loan_vote_status(_lid)
-            _ltable = _table("loans")
-            with db() as _con:
-                _override = _con.execute(
-                    f"SELECT COALESCE(admin_approved, FALSE) AS admin_approved FROM {_ltable} WHERE id=?",
-                    (_lid,),
-                ).fetchone()
-                _final_status = "Confirmé" if (_override and bool(_override["admin_approved"])) else _vstatus
-                _con.execute(f"UPDATE {_ltable} SET status=? WHERE id=?", (_final_status, _lid))
-                _con.commit()
-    except Exception:
-        logging.exception("Erreur lors de l'initialisation des votes historiques")
-
-# ============================================================
 # INTERFACE
 # ============================================================
 
@@ -4058,75 +3766,33 @@ _db_fingerprint = "|".join([SUPABASE_HOST, SUPABASE_PORT, SUPABASE_DATABASE, SUP
 try:
     init_db(_db_fingerprint)
 except Exception as _db_exc:
-    logging.exception("Initialisation Supabase impossible", exc_info=_db_exc)
-    st.error("❌ Connexion Supabase impossible pour le moment.")
+    st.error("❌ Connexion Supabase impossible")
+    st.code(str(_db_exc))
     st.info("Vérifiez les secrets [postgres] et le paquet psycopg2-binary dans requirements.txt, puis redémarrez l'application.")
     st.stop()
 
-# Les prêts historiques sont synchronisés une seule fois par processus.
-bootstrap_existing_loans_once(_db_fingerprint)
+# Les prêts déjà présents reçoivent également leur bulletin de vote.
+try:
+    ensure_loan_admin_columns()
+    existing_loans = loans()
+    for _lid in existing_loans["id"].tolist() if not existing_loans.empty else []:
+        ensure_loan_votes(_lid)
+        _vdf, _vstatus = loan_vote_status(_lid)
+        _ltable = _table("loans")
+        with db() as _con:
+            _override = _con.execute(
+                f"SELECT COALESCE(admin_approved, FALSE) AS admin_approved FROM {_ltable} WHERE id=?",
+                (_lid,),
+            ).fetchone()
+            _final_status = "Confirmé" if (_override and bool(_override["admin_approved"])) else _vstatus
+            _con.execute(f"UPDATE {_ltable} SET status=? WHERE id=?", (_final_status, _lid))
+            _con.commit()
+except Exception:
+    pass
 
 if "user" not in st.session_state:
     st.session_state.user = None
-if "auth_last_activity" not in st.session_state:
-    st.session_state.auth_last_activity = None
-if "auth_last_verified" not in st.session_state:
-    st.session_state.auth_last_verified = None
 
-def enforce_session_security():
-    user = st.session_state.get("user")
-    if not user:
-        return
-    now = utc_now()
-    last = parse_datetime_safe(st.session_state.get("auth_last_activity"))
-    if last and (now - last).total_seconds() > AUTH_TIMEOUT_MINUTES * 60:
-        st.session_state.user = None
-        st.session_state.auth_last_activity = None
-        st.warning("Votre session a expiré pour des raisons de sécurité. Veuillez vous reconnecter.")
-        st.stop()
-    st.session_state.auth_last_activity = now
-
-enforce_session_security()
-
-if "auth_last_verified" not in st.session_state:
-    st.session_state.auth_last_verified = None
-
-def verify_authenticated_account():
-    user = st.session_state.get("user")
-    if not user:
-        return
-    last = parse_datetime_safe(st.session_state.get("auth_last_verified"))
-    now = utc_now()
-    if last and (now - last).total_seconds() < 60:
-        return
-    table = _table("admins" if user.get("role") == "admin" else "members")
-    try:
-        with db() as con:
-            if user.get("role") == "admin":
-                row = con.execute(f"SELECT active,credential_version FROM {table} WHERE id=? LIMIT 1", (user.get("id"),)).fetchone()
-            else:
-                row = con.execute(f"SELECT active,member_login_active,credential_version FROM {table} WHERE id=? LIMIT 1", (user.get("member_id"),)).fetchone()
-        valid = bool(row and row_value(row, "active") and (user.get("role") == "admin" or row_value(row, "member_login_active")))
-        current_version = int(row_value(row, "credential_version", 1) or 1) if row else 0
-        if not valid or current_version != int(user.get("credential_version", 1) or 1):
-            st.session_state.user = None
-            st.session_state.auth_last_activity = None
-            st.session_state.auth_last_verified = None
-            st.warning("Votre session a été invalidée. Veuillez vous reconnecter.")
-            st.stop()
-        st.session_state.auth_last_verified = now
-    except Exception as exc:
-        logging.exception("Vérification de session impossible", exc_info=exc)
-        # En cas d'indisponibilité de la base, on ne conserve pas indéfiniment
-        # une session sensible sans pouvoir vérifier son état.
-        st.session_state.user = None
-        st.session_state.auth_last_activity = None
-        st.session_state.auth_last_verified = None
-        st.warning("La session doit être vérifiée à nouveau. Veuillez vous reconnecter.")
-        st.stop()
-
-
-verify_authenticated_account()
 
 if st.session_state.user is None:
 
@@ -4171,21 +3837,18 @@ if st.session_state.user is None:
                 password = st.text_input("Mot de passe", type="password", placeholder="Mot de passe", key="admin_login_password")
                 submitted = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
                 if submitted:
-                    auth_error = False
                     try:
                         user = authenticate(username, password)
                     except Exception as exc:
-                        auth_error = True
-                        show_app_exception(exc, "Connexion impossible pour le moment. Vérifiez la connexion Supabase et la configuration des Secrets.")
+                        st.error("Connexion impossible. Vérifiez la configuration Supabase et les tables.")
+                        st.code(str(exc))
                         user = None
                     if user:
                         user["role"] = "admin"
                         st.session_state.user = user
-                        st.session_state.auth_last_activity = utc_now()
-                        st.session_state.auth_last_verified = utc_now()
                         st.rerun()
-                    elif not auth_error:
-                        st.error("Identifiants administrateur incorrects, compte désactivé ou temporairement verrouillé.")
+                    else:
+                        st.error("Identifiants administrateur incorrects.")
 
         with login_tab_member:
             with st.form("login_form_member", clear_on_submit=False):
@@ -4196,12 +3859,11 @@ if st.session_state.user is None:
                     try:
                         user = authenticate_member(member_username, member_password)
                     except Exception as exc:
-                        show_app_exception(exc, "Connexion membre impossible pour le moment. Réessayez.")
+                        st.error("Connexion membre impossible. Vérifiez la configuration de la base.")
+                        st.code(str(exc))
                         user = None
                     if user:
                         st.session_state.user = user
-                        st.session_state.auth_last_activity = utc_now()
-                        st.session_state.auth_last_verified = utc_now()
                         st.rerun()
                     else:
                         st.error("Identifiant ou mot de passe membre incorrect, ou compte désactivé.")
@@ -4219,7 +3881,7 @@ if st.session_state.user is None:
                             create_member_access_request(recovery_name, recovery_phone, recovery_username, recovery_reason)
                             st.success("Votre demande a été transmise à l'administrateur. Il pourra vérifier votre identité puis définir de nouveaux identifiants.")
                         except Exception as exc:
-                            show_app_exception(exc)
+                            st.error(str(exc))
 
         st.markdown(
             '<div class="info-card">🔒 Vos données d’épargne, de cotisations et de prêts sont enregistrées dans la base configurée par l’administrateur.</div>',
@@ -4359,7 +4021,7 @@ with brand_col:
 
 with user_col:
     st.markdown(
-        f'<div class="top-user">👤 <strong>{html.escape(str(st.session_state.user["full_name"]))}</strong></div>',
+        f'<div class="top-user">👤 <strong>{st.session_state.user["full_name"]}</strong></div>',
         unsafe_allow_html=True,
     )
 
@@ -4396,8 +4058,6 @@ with action_col1:
 with action_col2:
     if st.button("↪ Déconnexion", use_container_width=True, key="top_logout"):
         st.session_state.user = None
-        st.session_state.auth_last_activity = None
-        st.session_state.auth_last_verified = None
         st.rerun()
 
 if use_supabase():
@@ -4476,7 +4136,7 @@ elif page == "Membres":
 
                 except Exception as exc:
 
-                    show_app_exception(exc)
+                    st.error(str(exc))
 
     member_flash = st.session_state.pop("member_flash", None)
     if member_flash:
@@ -4500,7 +4160,7 @@ elif page == "Membres":
                     "dans public.members."
                 )
             except Exception as exc:
-                show_app_exception(exc, "Impossible de lire les membres pour le moment.")
+                st.error(f"Lecture de public.members impossible : {exc}")
 
     st.dataframe(
         df,
@@ -4594,7 +4254,7 @@ elif page == "Membres":
                 st.success("Membre et données associées supprimés.")
                 st.rerun()
             except Exception as exc:
-                show_app_exception(exc, "Suppression impossible. Vérifiez les données puis réessayez.")
+                st.error(f"Suppression impossible : {exc}")
 
 
 # ============================================================
@@ -4620,7 +4280,7 @@ elif page == "Cotisations":
                     st.success("Cotisation enregistrée.")
                     st.rerun()
                 except Exception as exc:
-                    show_app_exception(exc)
+                    st.error(str(exc))
         st.divider()
         cdf = contributions()
         st.subheader("📋 Historique des cotisations")
@@ -4645,7 +4305,7 @@ elif page == "Cotisations":
                         st.success("Cotisation modifiée.")
                         st.rerun()
                     except Exception as exc:
-                        show_app_exception(exc)
+                        st.error(str(exc))
 
             st.divider()
             delete_c_confirm = st.checkbox("Je confirme la suppression définitive de cette cotisation.", key=f"confirm_delete_contribution_{cid}")
@@ -4655,7 +4315,7 @@ elif page == "Cotisations":
                     st.success("Cotisation supprimée.")
                     st.rerun()
                 except Exception as exc:
-                    show_app_exception(exc, "Suppression impossible. Vérifiez les données puis réessayez.")
+                    st.error(f"Suppression impossible : {exc}")
 
 
 # ============================================================
@@ -4685,7 +4345,7 @@ elif page == "Emprunts":
                     st.success("Prêt enregistré. Il est maintenant soumis aux votes des autres membres actifs.")
                     st.rerun()
                 except Exception as exc:
-                    show_app_exception(exc)
+                    st.error(str(exc))
 
         st.divider()
         ldf = loans()
@@ -4745,7 +4405,7 @@ elif page == "Emprunts":
                         st.success("Approbation administrative retirée ; le statut a été recalculé selon les votes.")
                         st.rerun()
                     except Exception as exc:
-                        show_app_exception(exc)
+                        st.error(str(exc))
             else:
                 st.warning(
                     f"Statut actuel : {_vstatus_admin}. Cette action peut confirmer le prêt même en présence d'un veto."
@@ -4770,7 +4430,7 @@ elif page == "Emprunts":
                                 st.success("Prêt confirmé exceptionnellement par l'administration.")
                                 st.rerun()
                             except Exception as exc:
-                                show_app_exception(exc)
+                                st.error(str(exc))
 
         if not ldf.empty:
             loan_options = {f"#{safe_int_id(r['id'])} — {r['full_name']} — {money(r['principal'])}": safe_int_id(r['id']) for _,r in ldf.iterrows() if safe_int_id(r.get('id')) is not None}
@@ -4796,7 +4456,7 @@ elif page == "Emprunts":
                             st.success("Prêt modifié.")
                             st.rerun()
                         except Exception as exc:
-                            show_app_exception(exc)
+                            st.error(str(exc))
 
             st.divider()
             st.subheader("🗑️ Supprimer le prêt")
@@ -4808,7 +4468,7 @@ elif page == "Emprunts":
                     st.success("Prêt, échéances et votes supprimés.")
                     st.rerun()
                 except Exception as exc:
-                    show_app_exception(exc, "Suppression impossible. Vérifiez les données puis réessayez.")
+                    st.error(f"Suppression impossible : {exc}")
 
             idf = get_installments(loan_id).copy()
             if not idf.empty:
@@ -4844,7 +4504,7 @@ elif page == "Emprunts":
                             st.success("Échéance et remboursement mis à jour.")
                             st.rerun()
                         except Exception as exc:
-                            show_app_exception(exc)
+                            st.error(str(exc))
 
                 st.divider()
                 delete_inst_confirm = st.checkbox("Je confirme la suppression définitive de cette échéance.", key=f"confirm_delete_installment_{installment_id}")
@@ -4854,7 +4514,7 @@ elif page == "Emprunts":
                         st.success("Échéance supprimée et statut du prêt recalculé.")
                         st.rerun()
                     except Exception as exc:
-                        show_app_exception(exc, "Suppression impossible. Vérifiez les données puis réessayez.")
+                        st.error(f"Suppression impossible : {exc}")
 
                 total_due = float(pd.to_numeric(idf['amount_due'], errors='coerce').fillna(0).sum())
                 total_paid = float(pd.to_numeric(idf['amount_paid'], errors='coerce').fillna(0).sum())
@@ -4922,7 +4582,7 @@ elif page == "Rappels WhatsApp":
                         st.success("WhatsApp est prêt avec le message rempli. Cliquez sur le bouton ci-dessous pour l'envoyer.")
                         st.link_button("💬 Ouvrir WhatsApp et envoyer", wa["url"], use_container_width=True)
                     except Exception as exc:
-                        show_app_exception(exc)
+                        st.error(str(exc))
             with c2:
                 if st.button("👤 Espace membre", key="space_contribution"):
                     create_member_reminder(member_id, "cotisation", "Rappel de cotisation", msg, date.today(), False)
@@ -4953,7 +4613,7 @@ elif page == "Rappels WhatsApp":
                                 st.success("WhatsApp est prêt avec le message rempli. Cliquez sur le bouton ci-dessous pour l'envoyer.")
                                 st.link_button("💬 Ouvrir WhatsApp et envoyer", wa["url"], use_container_width=True)
                             except Exception as exc:
-                                show_app_exception(exc)
+                                st.error(str(exc))
                     with c2:
                         if st.button("👤 Espace membre", key="space_loan"):
                             create_member_reminder(member_id, "remboursement", "Rappel de remboursement", msg, pd.to_datetime(rr["due_date"]).date(), False)
@@ -4972,7 +4632,7 @@ elif page == "Rappels WhatsApp":
                         st.success("WhatsApp est prêt avec la remarque remplie. Cliquez sur le bouton ci-dessous pour l'envoyer.")
                         st.link_button("💬 Ouvrir WhatsApp et envoyer", wa["url"], use_container_width=True)
                     except Exception as exc:
-                        show_app_exception(exc)
+                        st.error(str(exc))
             with c2:
                 if st.button("👤 Publier dans l'espace membre", key="space_remark"):
                     create_member_reminder(member_id, "remarque", "Remarque de l'administration", custom, None, False)
@@ -5041,7 +4701,7 @@ elif page == "Communication":
                                 st.success("Réponse envoyée dans l'espace membre.")
                                 st.rerun()
                             except Exception as exc:
-                                show_app_exception(exc)
+                                st.error(str(exc))
 
     with ctab2:
         mdf = get_members(True)
@@ -5073,7 +4733,7 @@ elif page == "Communication":
                         st.success("Message envoyé au membre.")
                         st.rerun()
                     except Exception as exc:
-                        show_app_exception(exc)
+                        st.error(str(exc))
 
 
 elif page == "Rapport global":
@@ -5216,27 +4876,9 @@ elif page == "Administrateurs":
                     st.success("Administrateur ajouté.")
                     st.rerun()
                 except Exception as exc:
-                    show_app_exception(exc, "Impossible d’ajouter l’administrateur pour le moment.")
+                    st.error(f"Impossible d'ajouter l'administrateur : {exc}")
         st.divider()
         st.dataframe(get_admins(), use_container_width=True, hide_index=True)
-
-        st.subheader("🔐 Mon mot de passe administrateur")
-        with st.form("admin_change_password_form"):
-            admin_current_password = st.text_input("Mot de passe actuel", type="password", key="admin_current_password")
-            admin_new_password = st.text_input("Nouveau mot de passe", type="password", key="admin_new_password")
-            admin_new_password_confirm = st.text_input("Confirmer le nouveau mot de passe", type="password", key="admin_new_password_confirm")
-            change_admin_pwd = st.form_submit_button("🔒 Modifier mon mot de passe", type="primary")
-            if change_admin_pwd:
-                if admin_new_password != admin_new_password_confirm:
-                    st.error("Les deux nouveaux mots de passe ne correspondent pas.")
-                else:
-                    try:
-                        change_admin_password(st.session_state.user.get("id"), admin_current_password, admin_new_password)
-                        st.session_state.user["credential_version"] = int(st.session_state.user.get("credential_version", 1) or 1) + 1
-                        st.session_state.auth_last_verified = utc_now()
-                        st.success("Votre mot de passe administrateur a été modifié.")
-                    except Exception as exc:
-                        show_app_exception(exc)
 
     with tab_members_accounts:
         st.subheader("Authentification des membres")
@@ -5270,7 +4912,7 @@ elif page == "Administrateurs":
                         st.success("Compte membre enregistré. Le membre peut maintenant se connecter depuis l'onglet Membre de la page d'accueil.")
                         st.rerun()
                     except Exception as exc:
-                        show_app_exception(exc)
+                        st.error(str(exc))
 
             st.markdown("### État des comptes membres")
             status_df = get_member_login_status().copy()
@@ -5329,4 +4971,4 @@ elif page == "Administrateurs":
                                     st.success("Nouveaux identifiants enregistrés et demande clôturée. Le membre pourra se reconnecter avec cet accès.")
                                     st.rerun()
                                 except Exception as exc:
-                                    show_app_exception(exc)
+                                    st.error(str(exc))
