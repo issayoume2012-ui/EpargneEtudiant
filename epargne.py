@@ -45,12 +45,31 @@ COUNTRY_CODE = "221"
 CURRENCY = "FCFA"
 
 def secret_or_env(name, default=""):
-    """Lit d'abord Streamlit Secrets, puis les variables d'environnement."""
+    """
+    Lit un secret de façon robuste.
+
+    Streamlit recommande de placer les secrets à la racine de secrets.toml.
+    Pour rester compatible avec une configuration où l'utilisateur aurait
+    accidentellement placé certains secrets dans une section TOML (par ex.
+    [browser]), on recherche également dans les sections existantes.
+    Les variables d'environnement restent le dernier recours.
+    """
     try:
         value = st.secrets.get(name, "")
+        if value not in (None, ""):
+            return value
+        for section_name in ("app", "security", "browser", "server", "admin", "postgres"):
+            try:
+                section = st.secrets.get(section_name, {})
+                if hasattr(section, "get"):
+                    nested = section.get(name, "")
+                    if nested not in (None, ""):
+                        return nested
+            except Exception:
+                continue
     except Exception:
-        value = ""
-    return value or os.getenv(name, default)
+        pass
+    return os.getenv(name, default)
 
 
 # Configuration Supabase / PostgreSQL.
@@ -72,6 +91,10 @@ def postgres_secret(name, default=""):
 ADMIN_NAME = secret_or_env("ADMIN_INITIAL_NAME", "Administrateur")
 ADMIN_USERNAME = secret_or_env("ADMIN_INITIAL_USERNAME", "")
 ADMIN_PASSWORD = secret_or_env("ADMIN_INITIAL_PASSWORD", "")
+# Réinitialisation volontaire et ponctuelle du compte administrateur.
+# Mettre ADMIN_FORCE_RESET=true uniquement pour récupérer un compte existant,
+# redéployer une fois, puis remettre immédiatement la valeur à false/supprimer.
+ADMIN_FORCE_RESET = str(secret_or_env("ADMIN_FORCE_RESET", "0")).strip().lower() in {"1", "true", "yes", "oui"}
 AUTH_TIMEOUT_MINUTES = int(secret_or_env("AUTH_TIMEOUT_MINUTES", "30") or 30)
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 MAX_PASSWORD_LENGTH = 256
@@ -1225,14 +1248,54 @@ def create_supabase_schema():
         # ------------------------------------------------------------
         if ADMIN_USERNAME and ADMIN_PASSWORD:
             validate_password(ADMIN_PASSWORD, "ADMIN_INITIAL_PASSWORD")
-            cur.execute(
-                """
-                INSERT INTO public.admins (username, password, full_name)
-                VALUES (?, ?, ?)
-                ON CONFLICT (username) DO NOTHING
-                """,
-                (ADMIN_USERNAME.strip(), hash_password(ADMIN_PASSWORD), (ADMIN_NAME or "Administrateur").strip()),
-            )
+            admin_username = ADMIN_USERNAME.strip()
+            admin_name = (ADMIN_NAME or "Administrateur").strip()
+            existing_admin = cur.execute(
+                "SELECT id, username, active FROM public.admins WHERE lower(username)=lower(?) LIMIT 1",
+                (admin_username,),
+            ).fetchone()
+
+            if ADMIN_FORCE_RESET:
+                # Réinitialisation explicite et ponctuelle.
+                # Si le compte portant le nouvel identifiant n'existe pas encore,
+                # on récupère le premier compte administrateur existant. Cela évite
+                # qu'un ancien identifiant oublié bloque définitivement l'accès.
+                reset_target = existing_admin
+                if reset_target is None:
+                    reset_target = cur.execute(
+                        "SELECT id, username, active FROM public.admins ORDER BY id ASC LIMIT 1"
+                    ).fetchone()
+
+                if reset_target is not None:
+                    cur.execute(
+                        """
+                        UPDATE public.admins
+                        SET username=?, password=?, full_name=?, active=TRUE,
+                            failed_login_attempts=0, locked_until=NULL,
+                            credential_version=COALESCE(credential_version,1)+1
+                        WHERE id=?
+                        """,
+                        (admin_username, hash_password(ADMIN_PASSWORD), admin_name, reset_target["id"]),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO public.admins
+                            (username, password, full_name, active, failed_login_attempts, locked_until, credential_version)
+                        VALUES (?, ?, ?, TRUE, 0, NULL, 1)
+                        """,
+                        (admin_username, hash_password(ADMIN_PASSWORD), admin_name),
+                    )
+            elif existing_admin is None:
+                cur.execute(
+                    """
+                    INSERT INTO public.admins
+                        (username, password, full_name, active, failed_login_attempts, locked_until, credential_version)
+                    VALUES (?, ?, ?, TRUE, 0, NULL, 1)
+                    ON CONFLICT (username) DO NOTHING
+                    """,
+                    (admin_username, hash_password(ADMIN_PASSWORD), admin_name),
+                )
 
         # ------------------------------------------------------------
         # 5. Reprise des anciennes colonnes de prêts.
@@ -4108,10 +4171,12 @@ if st.session_state.user is None:
                 password = st.text_input("Mot de passe", type="password", placeholder="Mot de passe", key="admin_login_password")
                 submitted = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
                 if submitted:
+                    auth_error = False
                     try:
                         user = authenticate(username, password)
                     except Exception as exc:
-                        show_app_exception(exc, "Connexion impossible pour le moment. Réessayez.")
+                        auth_error = True
+                        show_app_exception(exc, "Connexion impossible pour le moment. Vérifiez la connexion Supabase et la configuration des Secrets.")
                         user = None
                     if user:
                         user["role"] = "admin"
@@ -4119,8 +4184,8 @@ if st.session_state.user is None:
                         st.session_state.auth_last_activity = utc_now()
                         st.session_state.auth_last_verified = utc_now()
                         st.rerun()
-                    else:
-                        st.error("Identifiants administrateur incorrects.")
+                    elif not auth_error:
+                        st.error("Identifiants administrateur incorrects, compte désactivé ou temporairement verrouillé.")
 
         with login_tab_member:
             with st.form("login_form_member", clear_on_submit=False):
