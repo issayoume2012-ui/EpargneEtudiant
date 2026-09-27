@@ -1279,11 +1279,34 @@ def auto_migrate_sqlite_to_supabase():
         s.close()
 
 
+def ensure_loan_admin_columns():
+    """Garantit que les colonnes d'approbation administrative existent."""
+    if use_supabase():
+        with db() as con:
+            con.execute("ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approved BOOLEAN NOT NULL DEFAULT FALSE")
+            con.execute("ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approval_reason TEXT")
+            con.execute("ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approved_at TIMESTAMPTZ")
+            con.execute("UPDATE public.loans SET admin_approved=FALSE WHERE admin_approved IS NULL")
+            con.commit()
+    else:
+        with db() as con:
+            existing = {row["name"] for row in con.execute("PRAGMA table_info(loans)").fetchall()}
+            if "admin_approved" not in existing:
+                con.execute("ALTER TABLE loans ADD COLUMN admin_approved INTEGER DEFAULT 0")
+            if "admin_approval_reason" not in existing:
+                con.execute("ALTER TABLE loans ADD COLUMN admin_approval_reason TEXT")
+            if "admin_approved_at" not in existing:
+                con.execute("ALTER TABLE loans ADD COLUMN admin_approved_at TEXT")
+            con.execute("UPDATE loans SET admin_approved=0 WHERE admin_approved IS NULL")
+            con.commit()
+
+
 @st.cache_resource(show_spinner=False)
 def init_db(config_fingerprint=None):
     """Initialise exclusivement Supabase PostgreSQL."""
     require_supabase()
     create_supabase_schema()
+    ensure_loan_admin_columns()
     ensure_communication_schema()
     # La migration SQLite n'est lancée que si elle est explicitement activée.
     # Cela évite qu'une vieille base locale détourne ou ralentisse l'application.
@@ -2367,6 +2390,7 @@ def loan_vote_status(loan_id):
     Exception : un administrateur peut confirmer explicitement le prêt en cas de conflit,
     même si les votes sont incomplets ou contiennent un veto.
     """
+    ensure_loan_admin_columns()
     loan_id = safe_int_id(loan_id)
     ensure_loan_votes(loan_id)
     vt, mt, lt = _table("loan_votes"), _table("members"), _table("loans")
@@ -3426,6 +3450,7 @@ except Exception as _db_exc:
 
 # Les prêts déjà présents reçoivent également leur bulletin de vote.
 try:
+    ensure_loan_admin_columns()
     existing_loans = loans()
     for _lid in existing_loans["id"].tolist() if not existing_loans.empty else []:
         ensure_loan_votes(_lid)
