@@ -706,6 +706,9 @@ def migrate_database(con):
             "created_at": "TEXT",
             "total_interest_rate": "REAL DEFAULT 0",
             "installments_count": "INTEGER DEFAULT 1",
+            "admin_approved": "INTEGER DEFAULT 0",
+            "admin_approval_reason": "TEXT",
+            "admin_approved_at": "TEXT",
         },
         "loan_installments": {
             "installment_number": "INTEGER DEFAULT 1",
@@ -734,6 +737,9 @@ def migrate_database(con):
             "message": "TEXT",
             "message_type": "TEXT DEFAULT 'message'",
             "is_read": "INTEGER DEFAULT 0",
+            "attachment_name": "TEXT",
+            "attachment_mime": "TEXT",
+            "attachment_data": "BLOB",
             "created_at": "TEXT",
         },
         "member_reminders": {
@@ -843,6 +849,9 @@ def create_supabase_schema():
                 first_due_date DATE NOT NULL,
                 status TEXT NOT NULL DEFAULT 'Actif',
                 note TEXT,
+                admin_approved BOOLEAN NOT NULL DEFAULT FALSE,
+                admin_approval_reason TEXT,
+                admin_approved_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """,
@@ -880,6 +889,9 @@ def create_supabase_schema():
                 message TEXT NOT NULL,
                 message_type TEXT NOT NULL DEFAULT 'message',
                 is_read BOOLEAN NOT NULL DEFAULT FALSE,
+                attachment_name TEXT,
+                attachment_mime TEXT,
+                attachment_data BYTEA,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """,
@@ -916,6 +928,11 @@ def create_supabase_schema():
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS member_login_active BOOLEAN DEFAULT FALSE",
             "ALTER TABLE public.members ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
 
+            # member_messages
+            "ALTER TABLE public.member_messages ADD COLUMN IF NOT EXISTS attachment_name TEXT",
+            "ALTER TABLE public.member_messages ADD COLUMN IF NOT EXISTS attachment_mime TEXT",
+            "ALTER TABLE public.member_messages ADD COLUMN IF NOT EXISTS attachment_data BYTEA",
+
             # contributions
             "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS member_id BIGINT",
             "ALTER TABLE public.contributions ADD COLUMN IF NOT EXISTS payment_date DATE",
@@ -937,6 +954,9 @@ def create_supabase_schema():
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS total_interest_rate NUMERIC(8,4) DEFAULT 0",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS installments_count INTEGER DEFAULT 1",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approved BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approval_reason TEXT",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approved_at TIMESTAMPTZ",
 
             # loan_installments
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS loan_id BIGINT",
@@ -1111,7 +1131,8 @@ def ensure_communication_schema():
             id BIGSERIAL PRIMARY KEY, member_id BIGINT NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
             sender_role TEXT NOT NULL DEFAULT 'member', sender_member_id BIGINT REFERENCES public.members(id) ON DELETE SET NULL,
             subject TEXT, message TEXT NOT NULL, message_type TEXT NOT NULL DEFAULT 'message',
-            is_read BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            is_read BOOLEAN NOT NULL DEFAULT FALSE, attachment_name TEXT, attachment_mime TEXT,
+            attachment_data BYTEA, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
         con.execute("""CREATE TABLE IF NOT EXISTS public.member_reminders (
             id BIGSERIAL PRIMARY KEY, member_id BIGINT NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
@@ -1445,8 +1466,8 @@ def member_account_data_cached(member_id):
 
     member_df = read_sql(f"SELECT id, full_name, phone, monthly_target, notes, active, member_username, member_login_active, created_at FROM {mt} WHERE id=? LIMIT 1", [member_id])
     cdf = read_sql(f"SELECT c.id, c.member_id, m.full_name, c.payment_date, c.month_label, c.amount, c.note FROM {ct} c LEFT JOIN {mt} m ON m.id=c.member_id WHERE c.member_id=? ORDER BY c.payment_date DESC, c.id DESC", [member_id])
-    ldf = read_sql(f"SELECT l.id, l.member_id, m.full_name, l.loan_date, l.principal, l.interest_rate, l.total_due, l.duration_months, l.first_due_date, l.status, l.note FROM {lt} l LEFT JOIN {mt} m ON m.id=l.member_id WHERE l.member_id=? ORDER BY l.loan_date DESC, l.id DESC", [member_id])
-    idf = read_sql(f"SELECT i.id, i.loan_id, i.installment_number, i.due_date, i.amount_due, i.amount_paid, i.payment_date, i.note FROM {it} i JOIN {lt} l ON l.id=i.loan_id WHERE l.member_id=? ORDER BY i.due_date, i.id", [member_id])
+    ldf = read_sql(f"SELECT l.id, l.member_id, m.full_name, l.loan_date, l.principal, l.interest_rate, l.total_due, l.duration_months, l.first_due_date, l.status, l.note FROM {lt} l LEFT JOIN {mt} m ON m.id=l.member_id WHERE l.member_id=? AND l.status='Confirmé' ORDER BY l.loan_date DESC, l.id DESC", [member_id])
+    idf = read_sql(f"SELECT i.id, i.loan_id, i.installment_number, i.due_date, i.amount_due, i.amount_paid, i.payment_date, i.note FROM {it} i JOIN {lt} l ON l.id=i.loan_id WHERE l.member_id=? AND l.status='Confirmé' ORDER BY i.due_date, i.id", [member_id])
 
     cdf = _clean_contributions_df(cdf)
     for col in ('amount_due','amount_paid'):
@@ -1516,12 +1537,21 @@ def member_account_page(member_id):
             subject = st.text_input("Objet", placeholder="Question, remarque, demande...")
             msg_type = st.selectbox("Type", ["Message", "Réclamation"])
             message = st.text_area("Votre message", height=150)
+            attachment = st.file_uploader(
+                "📎 Joindre une photo, un PDF ou un document Word (facultatif, 10 Mo max)",
+                type=["png", "jpg", "jpeg", "webp", "pdf", "doc", "docx"],
+                key="member_message_attachment",
+            )
             send = st.form_submit_button("📨 Envoyer")
             if send:
                 try:
+                    attachment_bytes = attachment.getvalue() if attachment is not None else None
                     send_member_message_to_admin(
                         member_id, subject, message,
-                        "reclamation" if msg_type == "Réclamation" else "message"
+                        "reclamation" if msg_type == "Réclamation" else "message",
+                        attachment_name=attachment.name if attachment is not None else None,
+                        attachment_mime=attachment.type if attachment is not None else None,
+                        attachment_data=attachment_bytes,
                     )
                     st.success("Votre message a été transmis à l'administration.")
                     st.rerun()
@@ -1538,6 +1568,23 @@ def member_account_page(member_id):
                 label = "Réclamation" if r["message_type"] == "reclamation" else "Message"
                 st.markdown(f"**{sender} — {label} — {r['subject'] or 'Sans objet'}**")
                 st.write(str(r["message"]))
+                if r.get("attachment_name") and r.get("attachment_data") is not None:
+                    _att_data = r.get("attachment_data")
+                    if isinstance(_att_data, memoryview):
+                        _att_data = _att_data.tobytes()
+                    elif not isinstance(_att_data, (bytes, bytearray)):
+                        try:
+                            _att_data = bytes(_att_data)
+                        except Exception:
+                            _att_data = None
+                    if _att_data:
+                        st.download_button(
+                            "📎 Télécharger la pièce jointe",
+                            data=_att_data,
+                            file_name=str(r.get("attachment_name")),
+                            mime=str(r.get("attachment_mime") or "application/octet-stream"),
+                            key=f"member_attachment_{int(r['id'])}",
+                        )
                 st.caption(str(r["created_at"]))
                 if not bool(r["is_read"]):
                     mark_message_read(r["id"])
@@ -2080,14 +2127,18 @@ def update_installment(installment_id, due_date, amount_due, amount_paid, paymen
         con.commit()
     refresh_application_data()
 
-def loans(member_id=None):
+def loans(member_id=None, confirmed_only=False):
     lt = 'public.loans' if use_supabase() else 'loans'
     mt = 'public.members' if use_supabase() else 'members'
     query = f"SELECT l.id,l.member_id,m.full_name,l.loan_date,l.principal,l.interest_rate,l.total_due,l.duration_months,l.first_due_date,l.status,l.note FROM {lt} l LEFT JOIN {mt} m ON m.id=l.member_id"
-    params=[]
+    clauses, params = [], []
     if member_id is not None:
-        query += ' WHERE l.member_id=?'
+        clauses.append('l.member_id=?')
         params.append(int(member_id))
+    if confirmed_only:
+        clauses.append("l.status='Confirmé'")
+    if clauses:
+        query += ' WHERE ' + ' AND '.join(clauses)
     query += ' ORDER BY l.loan_date DESC,l.id DESC'
     return read_sql(query, params)
 
@@ -2172,18 +2223,29 @@ def _table(name):
 
 
 def create_member_message(member_id, message, subject="", message_type="message",
-                          sender_role="member", sender_member_id=None):
+                          sender_role="member", sender_member_id=None,
+                          attachment_name=None, attachment_mime=None, attachment_data=None):
+    """Crée un message avec pièce jointe facultative (image/PDF/Word)."""
     member_id = safe_int_id(member_id)
     if member_id is None or not str(message or "").strip():
         raise ValueError("Le membre et le message sont obligatoires.")
+    if attachment_data is not None:
+        if not isinstance(attachment_data, (bytes, bytearray, memoryview)):
+            raise ValueError("La pièce jointe est invalide.")
+        if len(attachment_data) > 10 * 1024 * 1024:
+            raise ValueError("La pièce jointe ne doit pas dépasser 10 Mo.")
     table = _table("member_messages")
     with db() as con:
         con.execute(
             f"""INSERT INTO {table}
-                (member_id, sender_role, sender_member_id, subject, message, message_type, is_read)
-                VALUES (?, ?, ?, ?, ?, ?, FALSE)""",
+                (member_id, sender_role, sender_member_id, subject, message, message_type,
+                 is_read, attachment_name, attachment_mime, attachment_data)
+                VALUES (?, ?, ?, ?, ?, ?, FALSE, ?, ?, ?)""",
             (member_id, sender_role, safe_int_id(sender_member_id),
-             str(subject or "").strip(), str(message).strip(), message_type),
+             str(subject or "").strip(), str(message).strip(), message_type,
+             str(attachment_name or "").strip() or None,
+             str(attachment_mime or "").strip() or None,
+             bytes(attachment_data) if attachment_data is not None else None),
         )
         con.commit()
 
@@ -2194,7 +2256,8 @@ def get_member_messages(member_id=None, unread_only=False):
     query = f"""
         SELECT mm.id, mm.member_id, m.full_name AS member_name,
                mm.sender_role, mm.sender_member_id, mm.subject, mm.message,
-               mm.message_type, mm.is_read, mm.created_at
+               mm.message_type, mm.is_read, mm.attachment_name, mm.attachment_mime,
+               mm.attachment_data, mm.created_at
         FROM {table} mm
         LEFT JOIN {mt} m ON m.id=mm.sender_member_id
     """
@@ -2246,19 +2309,23 @@ def get_member_reminders(member_id):
     )
 
 
-def send_member_message_to_admin(member_id, subject, message, message_type="message"):
-    """Le membre écrit à l'administration; la conversation est visible côté admin."""
+def send_member_message_to_admin(member_id, subject, message, message_type="message",
+                                 attachment_name=None, attachment_mime=None, attachment_data=None):
+    """Le membre écrit à l'administration avec pièce jointe facultative."""
     create_member_message(
         member_id, message, subject, message_type,
-        sender_role="member", sender_member_id=member_id
+        sender_role="member", sender_member_id=member_id,
+        attachment_name=attachment_name, attachment_mime=attachment_mime, attachment_data=attachment_data,
     )
 
 
-def send_admin_message_to_member(member_id, subject, message, message_type="message"):
-    """L'administration répond ou informe un membre."""
+def send_admin_message_to_member(member_id, subject, message, message_type="message",
+                                 attachment_name=None, attachment_mime=None, attachment_data=None):
+    """L'administration répond ou informe un membre avec pièce jointe facultative."""
     create_member_message(
         member_id, message, subject, message_type,
-        sender_role="admin", sender_member_id=None
+        sender_role="admin", sender_member_id=None,
+        attachment_name=attachment_name, attachment_mime=attachment_mime, attachment_data=attachment_data,
     )
 
 
@@ -2294,10 +2361,20 @@ def ensure_loan_votes(loan_id):
 
 
 def loan_vote_status(loan_id):
-    """Un seul veto bloque; le prêt est confirmé lorsque tous les autres membres ont voté oui."""
+    """Détermine le statut d'un prêt selon les votes ou une décision administrative exceptionnelle.
+
+    Règle normale : tous les autres membres actifs doivent approuver et un seul veto bloque.
+    Exception : un administrateur peut confirmer explicitement le prêt en cas de conflit,
+    même si les votes sont incomplets ou contiennent un veto.
+    """
+    loan_id = safe_int_id(loan_id)
     ensure_loan_votes(loan_id)
-    vt, mt = _table("loan_votes"), _table("members")
+    vt, mt, lt = _table("loan_votes"), _table("members"), _table("loans")
     with db() as con:
+        loan_override = con.execute(
+            f"SELECT COALESCE(admin_approved, FALSE) AS admin_approved FROM {lt} WHERE id=?",
+            (loan_id,),
+        ).fetchone()
         rows = con.execute(
             f"""SELECT lv.id, lv.loan_id, lv.voter_member_id, m.full_name AS voter_name,
                        lv.decision, lv.comment, lv.created_at
@@ -2305,18 +2382,22 @@ def loan_vote_status(loan_id):
                 LEFT JOIN {mt} m ON m.id=lv.voter_member_id
                 WHERE lv.loan_id=?
                 ORDER BY m.full_name, lv.id""",
-            (safe_int_id(loan_id),),
+            (loan_id,),
         ).fetchall()
+
     df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame(
         columns=["id","loan_id","voter_member_id","voter_name","decision","comment","created_at"]
     )
+    if loan_override and bool(loan_override["admin_approved"]):
+        return df, "Confirmé par l'administration"
+
     total = len(df)
-    vetoes = int((df["decision"] == "Veto").sum()) if not df.empty else 0
-    approvals = int((df["decision"] == "Approuvé").sum()) if not df.empty else 0
-    pending = int((df["decision"] == "En attente").sum()) if not df.empty else 0
+    vetoes = int((df["decision"].astype(str).str.strip() == "Veto").sum()) if not df.empty else 0
+    approvals = int((df["decision"].astype(str).str.strip() == "Approuvé").sum()) if not df.empty else 0
+    pending = int((df["decision"].astype(str).str.strip() == "En attente").sum()) if not df.empty else 0
     if vetoes:
         status = "Bloqué par un veto"
-    elif total == 0 or (approvals == total and pending == 0):
+    elif total > 0 and approvals == total and pending == 0:
         status = "Confirmé"
     else:
         status = "En attente de validation"
@@ -2359,6 +2440,76 @@ def cast_loan_vote(loan_id, voter_member_id, decision, comment=""):
                     VALUES (?, ?, ?, ?, datetime('now'))""",
                 (loan_id, voter_member_id, decision, str(comment or "").strip()),
             )
+        con.commit()
+    _, status = loan_vote_status(loan_id)
+    # Une approbation administrative reste enregistrée comme statut financier
+    # « Confirmé » afin que les rapports, échéances et bulletins la comptent correctement.
+    status_db = "Confirmé" if status == "Confirmé par l'administration" else status
+    with db() as con:
+        con.execute(f"UPDATE {lt} SET status=? WHERE id=?", (status_db, loan_id))
+        con.commit()
+    refresh_application_data()
+    return status
+
+
+def admin_approve_loan(loan_id, reason=""):
+    """Confirme exceptionnellement un prêt par décision administrative.
+
+    Cette action ne supprime pas les votes et ne modifie pas les décisions des membres.
+    Elle crée simplement une autorisation administrative persistante qui prime sur le
+    résultat du vote pour les calculs financiers, les remboursements et les bulletins.
+    """
+    loan_id = safe_int_id(loan_id)
+    reason = str(reason or "").strip()
+    if loan_id is None:
+        raise ValueError("Prêt invalide.")
+    if not reason:
+        raise ValueError("Indiquez le motif de l'approbation administrative exceptionnelle.")
+
+    lt = _table("loans")
+    with db() as con:
+        loan = con.execute(f"SELECT id FROM {lt} WHERE id=?", (loan_id,)).fetchone()
+        if not loan:
+            raise ValueError("Prêt introuvable.")
+        if use_supabase():
+            con.execute(
+                f"""UPDATE {lt}
+                    SET admin_approved=TRUE,
+                        admin_approval_reason=?,
+                        admin_approved_at=NOW(),
+                        status='Confirmé'
+                    WHERE id=?""",
+                (reason, loan_id),
+            )
+        else:
+            con.execute(
+                f"""UPDATE {lt}
+                    SET admin_approved=1,
+                        admin_approval_reason=?,
+                        admin_approved_at=datetime('now'),
+                        status='Confirmé'
+                    WHERE id=?""",
+                (reason, loan_id),
+            )
+        con.commit()
+    refresh_application_data()
+    return "Confirmé par l'administration"
+
+
+def revoke_admin_loan_approval(loan_id):
+    """Retire une approbation administrative et réévalue immédiatement les votes."""
+    loan_id = safe_int_id(loan_id)
+    if loan_id is None:
+        raise ValueError("Prêt invalide.")
+    lt = _table("loans")
+    with db() as con:
+        loan = con.execute(f"SELECT id FROM {lt} WHERE id=?", (loan_id,)).fetchone()
+        if not loan:
+            raise ValueError("Prêt introuvable.")
+        con.execute(
+            f"UPDATE {lt} SET admin_approved=FALSE, admin_approval_reason=NULL, admin_approved_at=NULL WHERE id=?",
+            (loan_id,),
+        )
         con.commit()
     _, status = loan_vote_status(loan_id)
     with db() as con:
@@ -2558,7 +2709,7 @@ def dashboard():
 
     mdf = get_members(True)
     cdf = contributions()
-    ldf = loans()
+    ldf = loans(confirmed_only=True)
 
     total_saved = (
         float(cdf["amount"].sum())
@@ -2641,7 +2792,7 @@ def generate_member_pdf(member_id):
 
     member = member_rows.iloc[0]
     cdf = contributions(member_id)
-    ldf = loans(member_id)
+    ldf = loans(member_id, confirmed_only=True)
     idf = pd.DataFrame()
     try:
         loan_ids = [safe_int_id(v) for v in ldf.get("id", pd.Series(dtype=object)).tolist()] if not ldf.empty else []
@@ -2652,7 +2803,17 @@ def generate_member_pdf(member_id):
         idf = pd.DataFrame()
 
     # Les colonnes peuvent être absentes ou contenir des valeurs texte/NULL.
-    # On normalise toujours les montants avant le calcul pour éviter le ValueError.
+    # On garantit les colonnes nécessaires avant tout tri/calcul : cela évite
+    # notamment le KeyError sur due_date quand aucun prêt confirmé n'existe.
+    required_idf_cols = ["id", "loan_id", "installment_number", "due_date", "amount_due", "amount_paid", "payment_date", "note"]
+    if idf is None or not isinstance(idf, pd.DataFrame):
+        idf = pd.DataFrame(columns=required_idf_cols)
+    for _col in required_idf_cols:
+        if _col not in idf.columns:
+            idf[_col] = pd.Series(index=idf.index, dtype=object)
+    if not idf.empty:
+        idf["due_date"] = pd.to_datetime(idf["due_date"], errors="coerce")
+        idf["payment_date"] = pd.to_datetime(idf["payment_date"], errors="coerce")
     amount_series = pd.to_numeric(cdf.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0)
     principal_series = pd.to_numeric(ldf.get("principal", pd.Series(dtype=float)), errors="coerce").fillna(0)
     due_series = pd.to_numeric(ldf.get("total_due", pd.Series(dtype=float)), errors="coerce").fillna(0)
@@ -2837,7 +2998,7 @@ def generate_member_pdf(member_id):
     # Historique détaillé des échéances et remboursements du membre.
     story.append(Paragraph("Historique des remboursements et solde", heading_style))
     payment_data = [["Échéance", "Date prévue", "Prévu", "Remboursé", "Reste", "Date paiement", "Statut"]]
-    for _, r in idf.sort_values(["due_date", "id"] if not idf.empty and "id" in idf.columns else ["due_date"]).iterrows():
+    for _, r in (idf.sort_values(["due_date", "id"], na_position="last") if not idf.empty else idf).iterrows():
         due = float(r.get("amount_due", 0) or 0)
         paid = float(r.get("amount_paid", 0) or 0)
         payment_data.append([
@@ -2915,8 +3076,8 @@ def generate_member_pdf(member_id):
 # RAPPORT GLOBAL PDF + EXCEL
 # ============================================================
 
-def all_installments():
-    """Récupère toutes les échéances en une seule requête (évite le N+1)."""
+def all_installments(confirmed_only=False):
+    """Récupère toutes les échéances; les prêts non confirmés peuvent être exclus."""
     if use_supabase():
         tables = ('public.loan_installments', 'public.loans', 'public.members')
     else:
@@ -2928,6 +3089,7 @@ def all_installments():
         FROM {tables[0]} i
         JOIN {tables[1]} l ON l.id=i.loan_id
         JOIN {tables[2]} m ON m.id=l.member_id
+        {"WHERE l.status='Confirmé'" if confirmed_only else ""}
         ORDER BY i.due_date, i.id
     """)
 
@@ -2936,7 +3098,7 @@ def global_report_data():
     """Construit une vue globale et détaillée de toute l'épargne enregistrée."""
     mdf = get_members(False).copy()
     cdf = contributions().copy()
-    ldf = loans().copy()
+    ldf = loans(confirmed_only=True).copy()
 
     if cdf.empty:
         cdf = pd.DataFrame(columns=["id", "member_id", "full_name", "payment_date", "month_label", "amount", "note"])
@@ -2945,7 +3107,7 @@ def global_report_data():
 
     # Échéances et remboursements enregistrés : une seule requête.
     try:
-        idf = all_installments().copy()
+        idf = all_installments(confirmed_only=True).copy()
     except Exception:
         idf = pd.DataFrame(columns=["id", "loan_id", "installment_number", "due_date", "amount_due", "amount_paid", "payment_date", "note", "member_id", "full_name"])
 
@@ -3267,6 +3429,16 @@ try:
     existing_loans = loans()
     for _lid in existing_loans["id"].tolist() if not existing_loans.empty else []:
         ensure_loan_votes(_lid)
+        _vdf, _vstatus = loan_vote_status(_lid)
+        _ltable = _table("loans")
+        with db() as _con:
+            _override = _con.execute(
+                f"SELECT COALESCE(admin_approved, FALSE) AS admin_approved FROM {_ltable} WHERE id=?",
+                (_lid,),
+            ).fetchone()
+            _final_status = "Confirmé" if (_override and bool(_override["admin_approved"])) else _vstatus
+            _con.execute(f"UPDATE {_ltable} SET status=? WHERE id=?", (_final_status, _lid))
+            _con.commit()
 except Exception:
     pass
 
@@ -3815,6 +3987,67 @@ elif page == "Emprunts":
             st.dataframe(pd.DataFrame(vote_rows), use_container_width=True, hide_index=True)
 
         if not ldf.empty:
+            st.subheader("🛡️ Approbation exceptionnelle par l'administration")
+            st.caption(
+                "En cas de conflit, l'administrateur peut confirmer exceptionnellement un prêt. "
+                "Cette décision prime sur les vetos et les votes incomplets et reste enregistrée dans la base."
+            )
+            admin_loan_options = {
+                f"#{safe_int_id(r['id'])} — {r['full_name']} — {money(r['principal'])} — {r.get('status', '')}": safe_int_id(r['id'])
+                for _, r in ldf.iterrows() if safe_int_id(r.get('id')) is not None
+            }
+            admin_selected_label = st.selectbox(
+                "Prêt concerné par la décision administrative",
+                list(admin_loan_options.keys()),
+                key="admin_exceptional_loan_select",
+            )
+            admin_selected_loan = admin_loan_options[admin_selected_label]
+            _vdf_admin, _vstatus_admin = loan_vote_status(admin_selected_loan)
+            _ltable_admin = _table("loans")
+            with db() as _con_admin:
+                _admin_row = _con_admin.execute(
+                    f"SELECT COALESCE(admin_approved, FALSE) AS admin_approved, admin_approval_reason, admin_approved_at FROM {_ltable_admin} WHERE id=?",
+                    (admin_selected_loan,),
+                ).fetchone()
+            _already_admin = bool(_admin_row and _admin_row["admin_approved"])
+            if _already_admin:
+                st.success("✅ Ce prêt bénéficie déjà d'une approbation administrative exceptionnelle.")
+                if _admin_row["admin_approval_reason"]:
+                    st.info(f"Motif enregistré : {_admin_row['admin_approval_reason']}")
+                if st.button("↩️ Retirer l'approbation administrative", key=f"revoke_admin_loan_{admin_selected_loan}"):
+                    try:
+                        revoke_admin_loan_approval(admin_selected_loan)
+                        st.success("Approbation administrative retirée ; le statut a été recalculé selon les votes.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            else:
+                st.warning(
+                    f"Statut actuel : {_vstatus_admin}. Cette action peut confirmer le prêt même en présence d'un veto."
+                )
+                with st.form(f"admin_exceptional_approval_form_{admin_selected_loan}"):
+                    admin_reason = st.text_area(
+                        "Motif obligatoire de la décision administrative",
+                        placeholder="Ex. conflit entre votants, situation exceptionnelle, décision de la commission…",
+                        height=100,
+                    )
+                    admin_confirm = st.checkbox(
+                        "Je confirme que cette approbation administrative exceptionnelle est volontaire.",
+                        key=f"admin_exceptional_confirm_{admin_selected_loan}",
+                    )
+                    admin_submit = st.form_submit_button("🛡️ Confirmer exceptionnellement le prêt", type="primary")
+                    if admin_submit:
+                        if not admin_confirm:
+                            st.error("Cochez la confirmation avant d'enregistrer la décision.")
+                        else:
+                            try:
+                                admin_approve_loan(admin_selected_loan, admin_reason)
+                                st.success("Prêt confirmé exceptionnellement par l'administration.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(str(exc))
+
+        if not ldf.empty:
             loan_options = {f"#{safe_int_id(r['id'])} — {r['full_name']} — {money(r['principal'])}": safe_int_id(r['id']) for _,r in ldf.iterrows() if safe_int_id(r.get('id')) is not None}
             selected_loan_label = st.selectbox("Prêt à gérer", list(loan_options.keys()), key="manage_loan_select")
             loan_id = loan_options[selected_loan_label]
@@ -4022,15 +4255,42 @@ elif page == "Communication":
                 with st.container(border=True):
                     st.markdown(f"**👤 {sender} — {kind} — {r['subject'] or 'Sans objet'}**")
                     st.write(str(r["message"]))
+                    if r.get("attachment_name") and r.get("attachment_data") is not None:
+                        _att_data = r.get("attachment_data")
+                        if isinstance(_att_data, memoryview):
+                            _att_data = _att_data.tobytes()
+                        elif not isinstance(_att_data, (bytes, bytearray)):
+                            try:
+                                _att_data = bytes(_att_data)
+                            except Exception:
+                                _att_data = None
+                        if _att_data:
+                            st.download_button(
+                                "📎 Télécharger la pièce jointe",
+                                data=_att_data,
+                                file_name=str(r.get("attachment_name")),
+                                mime=str(r.get("attachment_mime") or "application/octet-stream"),
+                                key=f"admin_attachment_{int(r['id'])}",
+                            )
                     st.caption(f"Reçu le {r['created_at']}")
                     if not bool(r["is_read"]):
                         mark_message_read(r["id"])
                     with st.form(f"reply_form_{int(r['id'])}"):
                         reply = st.text_area("Réponse", height=100, key=f"reply_{int(r['id'])}")
+                        reply_attachment = st.file_uploader(
+                            "📎 Pièce jointe (photo, PDF ou Word, 10 Mo max)",
+                            type=["png", "jpg", "jpeg", "webp", "pdf", "doc", "docx"],
+                            key=f"reply_attachment_{int(r['id'])}",
+                        )
                         send_reply = st.form_submit_button("📨 Répondre au membre")
                         if send_reply:
                             try:
-                                send_admin_message_to_member(int(r["member_id"]), f"Re: {r['subject'] or 'Message'}", reply)
+                                send_admin_message_to_member(
+                                    int(r["member_id"]), f"Re: {r['subject'] or 'Message'}", reply,
+                                    attachment_name=reply_attachment.name if reply_attachment is not None else None,
+                                    attachment_mime=reply_attachment.type if reply_attachment is not None else None,
+                                    attachment_data=reply_attachment.getvalue() if reply_attachment is not None else None,
+                                )
                                 st.success("Réponse envoyée dans l'espace membre.")
                                 st.rerun()
                             except Exception as exc:
@@ -4048,12 +4308,20 @@ elif page == "Communication":
                 subject = st.text_input("Objet")
                 message_type = st.selectbox("Type", ["Message", "Réclamation / suivi", "Information"])
                 message = st.text_area("Message", height=160)
+                attachment = st.file_uploader(
+                    "📎 Joindre une photo, un PDF ou un document Word (facultatif, 10 Mo max)",
+                    type=["png", "jpg", "jpeg", "webp", "pdf", "doc", "docx"],
+                    key="admin_new_message_attachment",
+                )
                 send = st.form_submit_button("📨 Envoyer dans l'espace membre", type="primary")
                 if send:
                     try:
                         send_admin_message_to_member(
                             target_id, subject, message,
-                            "reclamation" if message_type == "Réclamation / suivi" else "message"
+                            "reclamation" if message_type == "Réclamation / suivi" else "message",
+                            attachment_name=attachment.name if attachment is not None else None,
+                            attachment_mime=attachment.type if attachment is not None else None,
+                            attachment_data=attachment.getvalue() if attachment is not None else None,
                         )
                         st.success("Message envoyé au membre.")
                         st.rerun()
