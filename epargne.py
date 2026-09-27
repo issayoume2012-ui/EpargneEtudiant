@@ -1140,6 +1140,33 @@ def sqlite_table_exists(con, table_name):
     ).fetchone() is not None
 
 
+def ensure_member_access_requests_table():
+    """Garantit immédiatement l'existence de la table de récupération des accès.
+
+    Cette migration est volontairement NON mise en cache : elle protège aussi
+    les anciennes sessions Streamlit dont le cache de schéma a été créé avant
+    l'ajout de cette fonctionnalité. L'opération est idempotente et très légère.
+    """
+    if not use_supabase():
+        return
+    with db() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS public.member_access_requests (
+                id BIGSERIAL PRIMARY KEY,
+                member_id BIGINT REFERENCES public.members(id) ON DELETE SET NULL,
+                submitted_name TEXT NOT NULL,
+                submitted_phone TEXT,
+                submitted_username TEXT,
+                reason TEXT,
+                status TEXT NOT NULL DEFAULT 'En attente',
+                admin_note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                resolved_at TIMESTAMPTZ
+            )
+        """)
+        con.commit()
+
+
 @st.cache_resource(show_spinner=False)
 def ensure_communication_schema():
     """Crée de façon idempotente les tables des nouvelles fonctionnalités."""
@@ -1338,10 +1365,12 @@ def init_db(config_fingerprint=None):
     require_supabase()
     create_supabase_schema()
     ensure_loan_admin_columns()
+    ensure_member_access_requests_table()
     ensure_communication_schema()
-    # La migration SQLite n'est lancée que si elle est explicitement activée.
-    # Cela évite qu'une vieille base locale détourne ou ralentisse l'application.
-    migrate_flag = str(secret_or_env("MIGRATE_SQLITE_TO_SUPABASE", "1")).strip().lower()
+    # La migration SQLite historique est désactivée par défaut : elle peut
+    # ralentir inutilement chaque nouveau déploiement. Elle reste disponible
+    # si l'administrateur définit explicitement MIGRATE_SQLITE_TO_SUPABASE=1.
+    migrate_flag = str(secret_or_env("MIGRATE_SQLITE_TO_SUPABASE", "0")).strip().lower()
     if migrate_flag in {"1", "true", "yes", "oui"}:
         auto_migrate_sqlite_to_supabase()
     return
@@ -1551,6 +1580,9 @@ def create_member_access_request(submitted_name, submitted_phone="", submitted_u
     reason = str(reason or "").strip()
     if not name:
         raise ValueError("Votre nom complet est obligatoire pour la demande.")
+    # Sécurité supplémentaire pour les anciennes sessions/cache Streamlit :
+    # la table est garantie juste avant l'INSERT.
+    ensure_member_access_requests_table()
     table = _table("member_access_requests")
     mt = _table("members")
     with db() as con:
