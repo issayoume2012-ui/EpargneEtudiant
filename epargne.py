@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
 import urllib.parse
+import html
+import time
 
 import pandas as pd
 import streamlit as st
@@ -41,6 +43,11 @@ ADMIN_PASSWORD = "issayoume2026"
 WHATSAPP = "777521969"
 COUNTRY_CODE = "221"
 CURRENCY = "FCFA"
+
+# Sécurité de session : les identifiants existants ne sont pas modifiés.
+SESSION_TIMEOUT_SECONDS = 45 * 60
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCK_SECONDS = 60
 
 def secret_or_env(name, default=""):
     """Lit d'abord Streamlit Secrets, puis les variables d'environnement."""
@@ -91,6 +98,7 @@ st.set_page_config(
     page_title="Épargne Étudiant",
     page_icon="💰",
     layout="wide",
+    initial_sidebar_state="collapsed",
     menu_items={"Get help": None, "Report a bug": None, "About": None},
 )
 
@@ -129,21 +137,45 @@ def inject_brand_css():
             background: rgba(255,255,255,.82);
         }}
 
-        /* Masque la barre d'outils Streamlit (Share, GitHub, Edit, etc.) dans l'application. */
+        /* Verrouillage visuel de l'interface Streamlit : aucun menu, outil,
+           bouton de partage/déploiement ou élément décoratif Streamlit visible. */
+        [data-testid="stHeader"],
         [data-testid="stToolbar"],
         [data-testid="stDecoration"],
         [data-testid="stStatusWidget"],
-        [data-testid="stAppDeployButton"] {{
+        [data-testid="stAppDeployButton"],
+        [data-testid="stDeployButton"],
+        [data-testid="stMainMenu"],
+        #MainMenu,
+        footer,
+        button[kind="headerNoPadding"] {{
             display: none !important;
             visibility: hidden !important;
+            height: 0 !important;
+            min-height: 0 !important;
+            max-height: 0 !important;
+            overflow: hidden !important;
+            pointer-events: none !important;
         }}
 
-        /* Masque le bouton « Gérer l'application » selon les versions de Streamlit. */
-        button[kind="headerNoPadding"],
-        [data-testid="stAppDeployButton"],
-        [data-testid="stDeployButton"] {{
+        /* Les éléments Streamlit masqués ne doivent pas conserver d'espace
+           cliquable, notamment sur les petits écrans. */
+        [data-testid="stAppViewContainer"] {{
+            padding-top: 0 !important;
+        }}
+        [data-testid="stHeader"] * {{
+            display: none !important;
+        }}
+
+        /* Masque également les anciens sélecteurs utilisés par certaines
+           versions de Streamlit. */
+        button[title="Deploy"],
+        button[aria-label="Deploy"],
+        [aria-label="Main menu"],
+        [aria-label="Share"] {{
             display: none !important;
             visibility: hidden !important;
+            pointer-events: none !important;
         }}
 
         [data-testid="stSidebar"] {{
@@ -1455,6 +1487,67 @@ def add_months(d, months):
     day = min(d.day, 28)
 
     return date(year, month, day)
+
+
+# ============================================================
+# SÉCURITÉ DE SESSION
+# ============================================================
+
+def clear_auth_session():
+    """Ferme proprement la session sans modifier les identifiants en base."""
+    for key in (
+        "user",
+        "auth_last_activity",
+        "auth_login_attempts",
+        "auth_lock_until",
+    ):
+        st.session_state.pop(key, None)
+
+
+def mark_authenticated(user):
+    """Enregistre uniquement l'état de session après une authentification réussie."""
+    st.session_state.user = user
+    st.session_state.auth_last_activity = time.time()
+    st.session_state.auth_login_attempts = 0
+    st.session_state.auth_lock_until = 0.0
+
+
+def login_is_locked():
+    lock_until = float(st.session_state.get("auth_lock_until", 0.0) or 0.0)
+    if time.time() < lock_until:
+        remaining = max(1, int(lock_until - time.time()))
+        return True, remaining
+    return False, 0
+
+
+def register_failed_login():
+    attempts = int(st.session_state.get("auth_login_attempts", 0) or 0) + 1
+    st.session_state.auth_login_attempts = attempts
+    if attempts >= MAX_LOGIN_ATTEMPTS:
+        st.session_state.auth_lock_until = time.time() + LOGIN_LOCK_SECONDS
+        st.session_state.auth_login_attempts = 0
+
+
+def enforce_session_security():
+    """Déconnecte automatiquement une session inactive depuis trop longtemps."""
+    user = st.session_state.get("user")
+    if not user:
+        return
+
+    now = time.time()
+    last_activity = float(st.session_state.get("auth_last_activity", now) or now)
+    if now - last_activity > SESSION_TIMEOUT_SECONDS:
+        clear_auth_session()
+        st.session_state.auth_timeout_message = True
+        st.rerun()
+
+    # L'activité est rafraîchie à chaque interaction/rechargement Streamlit.
+    st.session_state.auth_last_activity = now
+
+
+def safe_display_text(value):
+    """Évite qu'un texte utilisateur injecté dans du HTML ne devienne du HTML actif."""
+    return html.escape(str(value or ""), quote=True)
 
 
 # ============================================================
@@ -3765,10 +3858,9 @@ def generate_global_pdf():
 _db_fingerprint = "|".join([SUPABASE_HOST, SUPABASE_PORT, SUPABASE_DATABASE, SUPABASE_USER, SUPABASE_PASSWORD[:8] if SUPABASE_PASSWORD else ""])
 try:
     init_db(_db_fingerprint)
-except Exception as _db_exc:
-    st.error("❌ Connexion Supabase impossible")
-    st.code(str(_db_exc))
-    st.info("Vérifiez les secrets [postgres] et le paquet psycopg2-binary dans requirements.txt, puis redémarrez l'application.")
+except Exception:
+    st.error("❌ Connexion au service impossible pour le moment.")
+    st.info("Vérifiez la configuration Supabase et redémarrez l'application.")
     st.stop()
 
 # Les prêts déjà présents reçoivent également leur bulletin de vote.
@@ -3793,6 +3885,11 @@ except Exception:
 if "user" not in st.session_state:
     st.session_state.user = None
 
+# Sécurité de session : déconnexion automatique après inactivité.
+enforce_session_security()
+
+if st.session_state.pop("auth_timeout_message", False):
+    st.warning("Votre session a été fermée automatiquement après une période d'inactivité. Reconnectez-vous.")
 
 if st.session_state.user is None:
 
@@ -3837,18 +3934,23 @@ if st.session_state.user is None:
                 password = st.text_input("Mot de passe", type="password", placeholder="Mot de passe", key="admin_login_password")
                 submitted = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
                 if submitted:
-                    try:
-                        user = authenticate(username, password)
-                    except Exception as exc:
-                        st.error("Connexion impossible. Vérifiez la configuration Supabase et les tables.")
-                        st.code(str(exc))
-                        user = None
-                    if user:
-                        user["role"] = "admin"
-                        st.session_state.user = user
-                        st.rerun()
+                    locked, remaining = login_is_locked()
+                    if locked:
+                        st.error(f"Trop de tentatives. Réessayez dans environ {remaining} seconde(s).")
                     else:
-                        st.error("Identifiants administrateur incorrects.")
+                        try:
+                            user = authenticate(username, password)
+                        except Exception:
+                            # Ne jamais afficher au téléphone le détail SQL/configuration.
+                            st.error("Connexion impossible pour le moment. Réessayez.")
+                            user = None
+                        if user:
+                            user["role"] = "admin"
+                            mark_authenticated(user)
+                            st.rerun()
+                        else:
+                            register_failed_login()
+                            st.error("Identifiants administrateur incorrects.")
 
         with login_tab_member:
             with st.form("login_form_member", clear_on_submit=False):
@@ -3856,17 +3958,21 @@ if st.session_state.user is None:
                 member_password = st.text_input("Mot de passe membre", type="password", placeholder="Votre mot de passe", key="member_login_password")
                 member_submitted = st.form_submit_button("Accéder à mon compte", type="primary", use_container_width=True)
                 if member_submitted:
-                    try:
-                        user = authenticate_member(member_username, member_password)
-                    except Exception as exc:
-                        st.error("Connexion membre impossible. Vérifiez la configuration de la base.")
-                        st.code(str(exc))
-                        user = None
-                    if user:
-                        st.session_state.user = user
-                        st.rerun()
+                    locked, remaining = login_is_locked()
+                    if locked:
+                        st.error(f"Trop de tentatives. Réessayez dans environ {remaining} seconde(s).")
                     else:
-                        st.error("Identifiant ou mot de passe membre incorrect, ou compte désactivé.")
+                        try:
+                            user = authenticate_member(member_username, member_password)
+                        except Exception:
+                            st.error("Connexion membre impossible pour le moment. Réessayez.")
+                            user = None
+                        if user:
+                            mark_authenticated(user)
+                            st.rerun()
+                        else:
+                            register_failed_login()
+                            st.error("Identifiant ou mot de passe membre incorrect, ou compte désactivé.")
 
             with st.expander("🆘 Accès oublié ? Signaler le problème à l'administrateur"):
                 st.caption("Si vous ne pouvez plus vous connecter, indiquez vos informations d'identification. L'administrateur vérifiera votre identité et pourra définir un nouvel accès et un nouveau mot de passe.")
@@ -3897,6 +4003,7 @@ if st.session_state.user is None:
 # ============================================================
 
 user_role = st.session_state.user.get("role", "admin")
+st.session_state.auth_last_activity = time.time()
 
 # Navigation principale en haut de page : aucun menu latéral.
 st.markdown(
@@ -3910,6 +4017,22 @@ st.markdown(
     /* La zone principale reprend toute la largeur. */
     [data-testid="stAppViewContainer"] > .main {
         margin-left: 0 !important;
+    }
+
+    /* Protection supplémentaire contre les éléments d'interface Streamlit
+       réinjectés lors d'un changement de page/rerun sur mobile. */
+    [data-testid="stHeader"],
+    [data-testid="stToolbar"],
+    [data-testid="stDecoration"],
+    [data-testid="stStatusWidget"],
+    [data-testid="stAppDeployButton"],
+    [data-testid="stDeployButton"],
+    [data-testid="stMainMenu"],
+    #MainMenu,
+    footer {
+        display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
     }
 
     .top-navigation {
@@ -4020,8 +4143,9 @@ with brand_col:
     )
 
 with user_col:
+    safe_user_name = safe_display_text(st.session_state.user.get("full_name", "Utilisateur"))
     st.markdown(
-        f'<div class="top-user">👤 <strong>{st.session_state.user["full_name"]}</strong></div>',
+        f'<div class="top-user">👤 <strong>{safe_user_name}</strong></div>',
         unsafe_allow_html=True,
     )
 
@@ -4057,7 +4181,7 @@ with action_col1:
         st.rerun()
 with action_col2:
     if st.button("↪ Déconnexion", use_container_width=True, key="top_logout"):
-        st.session_state.user = None
+        clear_auth_session()
         st.rerun()
 
 if use_supabase():
