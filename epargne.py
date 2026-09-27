@@ -2082,6 +2082,46 @@ def update_member(member_id, name, phone, target, notes, active):
         return updated_id
 
 
+def delete_member(member_id):
+    """Supprime un membre et toutes ses données directement rattachées."""
+    member_id = safe_int_id(member_id)
+    if member_id is None:
+        raise ValueError("Identifiant membre invalide.")
+    mt = _table("members")
+    tables = [
+        _table("contributions"),
+        _table("loan_votes"),
+        _table("loan_installments"),
+        _table("loans"),
+        _table("member_messages"),
+        _table("member_reminders"),
+        _table("member_access_requests"),
+    ]
+    with db() as con:
+        member = con.execute(f"SELECT id, full_name FROM {mt} WHERE id=? LIMIT 1", (member_id,)).fetchone()
+        if not member:
+            raise ValueError("Membre introuvable.")
+        # Suppression explicite des dépendances pour rester fiable même si
+        # une ancienne base n'a pas les mêmes règles ON DELETE CASCADE.
+        # Les demandes d'accès peuvent rester comme historique anonymisé.
+        con.execute(f"DELETE FROM {tables[0]} WHERE member_id=?", (member_id,))
+        con.execute(f"DELETE FROM {tables[2]} WHERE loan_id IN (SELECT id FROM {tables[3]} WHERE member_id=?)", (member_id,))
+        con.execute(f"DELETE FROM {tables[1]} WHERE voter_member_id=?", (member_id,))
+        con.execute(f"DELETE FROM {tables[1]} WHERE loan_id IN (SELECT id FROM {tables[3]} WHERE member_id=?)", (member_id,))
+        con.execute(f"DELETE FROM {tables[3]} WHERE member_id=?", (member_id,))
+        con.execute(f"DELETE FROM {tables[4]} WHERE member_id=? OR sender_member_id=?", (member_id, member_id))
+        con.execute(f"DELETE FROM {tables[5]} WHERE member_id=?", (member_id,))
+        con.execute(f"UPDATE {tables[6]} SET member_id=NULL WHERE member_id=?", (member_id,))
+        con.execute(f"DELETE FROM {mt} WHERE id=?", (member_id,))
+        con.commit()
+    try:
+        member_account_data_cached.clear()
+    except Exception:
+        pass
+    refresh_application_data()
+
+
+
 # ============================================================
 # COTISATIONS
 # ============================================================
@@ -2358,6 +2398,25 @@ def update_loan(loan_id, member_id, loan_date, principal, rate, duration, first_
     refresh_application_data()
 
 
+def delete_loan(loan_id):
+    """Supprime un prêt, ses échéances et ses votes."""
+    loan_id = safe_int_id(loan_id)
+    if loan_id is None:
+        raise ValueError("Prêt invalide.")
+    lt = _table("loans")
+    it = _table("loan_installments")
+    vt = _table("loan_votes")
+    with db() as con:
+        row = con.execute(f"SELECT id FROM {lt} WHERE id=? LIMIT 1", (loan_id,)).fetchone()
+        if not row:
+            raise ValueError("Prêt introuvable.")
+        con.execute(f"DELETE FROM {vt} WHERE loan_id=?", (loan_id,))
+        con.execute(f"DELETE FROM {it} WHERE loan_id=?", (loan_id,))
+        con.execute(f"DELETE FROM {lt} WHERE id=?", (loan_id,))
+        con.commit()
+    refresh_application_data()
+
+
 def update_installment(installment_id, due_date, amount_due, amount_paid, payment_date, note):
     installment_id = safe_int_id(installment_id)
     if installment_id is None:
@@ -2381,6 +2440,38 @@ def update_installment(installment_id, due_date, amount_due, amount_paid, paymen
         con.execute(f"UPDATE {lt} SET status=? WHERE id=?", (status, loan_id))
         con.commit()
     refresh_application_data()
+
+def delete_installment(installment_id):
+    """Supprime une échéance et recalcule le statut du prêt."""
+    installment_id = safe_int_id(installment_id)
+    if installment_id is None:
+        raise ValueError("Échéance invalide.")
+    it = _table("loan_installments")
+    lt = _table("loans")
+    with db() as con:
+        row = con.execute(f"SELECT loan_id FROM {it} WHERE id=? LIMIT 1", (installment_id,)).fetchone()
+        if not row:
+            raise ValueError("Échéance introuvable.")
+        loan_id = safe_int_id(row["loan_id"])
+        con.execute(f"DELETE FROM {it} WHERE id=?", (installment_id,))
+        if loan_id is not None:
+            total = con.execute(
+                f"SELECT COUNT(*) AS n, COALESCE(SUM(amount_due),0) AS due, COALESCE(SUM(amount_paid),0) AS paid FROM {it} WHERE loan_id=?",
+                (loan_id,),
+            ).fetchone()
+            n = int(total["n"] or 0)
+            due = float(total["due"] or 0)
+            paid = float(total["paid"] or 0)
+            if n == 0:
+                status = "Actif"
+            elif paid >= due - 0.01:
+                status = "Remboursé"
+            else:
+                status = "Actif"
+            con.execute(f"UPDATE {lt} SET status=? WHERE id=?", (status, loan_id))
+        con.commit()
+    refresh_application_data()
+
 
 def loans(member_id=None, confirmed_only=False):
     lt = 'public.loans' if use_supabase() else 'loans'
@@ -4153,6 +4244,18 @@ elif page == "Membres":
 
                 st.rerun()
 
+        st.divider()
+        st.subheader("🗑️ Supprimer le membre")
+        st.warning("La suppression retire le membre et ses cotisations, emprunts, échéances, votes, messages et rappels associés. Les demandes d'accès conservées perdent seulement leur lien avec ce membre.")
+        delete_member_confirm = st.checkbox("Je confirme la suppression définitive de ce membre et de ses données associées.", key=f"confirm_delete_member_{member_id}")
+        if st.button("🗑️ Supprimer définitivement ce membre", key=f"delete_member_{member_id}", type="secondary", disabled=not delete_member_confirm):
+            try:
+                delete_member(member_id)
+                st.success("Membre et données associées supprimés.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Suppression impossible : {exc}")
+
 
 # ============================================================
 # COTISATIONS
@@ -4203,6 +4306,16 @@ elif page == "Cotisations":
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
+
+            st.divider()
+            delete_c_confirm = st.checkbox("Je confirme la suppression définitive de cette cotisation.", key=f"confirm_delete_contribution_{cid}")
+            if st.button("🗑️ Supprimer cette cotisation", key=f"delete_contribution_{cid}", disabled=not delete_c_confirm):
+                try:
+                    delete_contribution(cid)
+                    st.success("Cotisation supprimée.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Suppression impossible : {exc}")
 
 
 # ============================================================
@@ -4345,6 +4458,18 @@ elif page == "Emprunts":
                         except Exception as exc:
                             st.error(str(exc))
 
+            st.divider()
+            st.subheader("🗑️ Supprimer le prêt")
+            st.warning("La suppression retire définitivement le prêt, ses échéances et ses votes. Elle ne supprime pas le membre ni ses autres données.")
+            delete_loan_confirm = st.checkbox("Je confirme la suppression définitive de ce prêt et de ses échéances.", key=f"confirm_delete_loan_{loan_id}")
+            if st.button("🗑️ Supprimer définitivement ce prêt", key=f"delete_loan_{loan_id}", disabled=not delete_loan_confirm):
+                try:
+                    delete_loan(loan_id)
+                    st.success("Prêt, échéances et votes supprimés.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Suppression impossible : {exc}")
+
             idf = get_installments(loan_id).copy()
             if not idf.empty:
                 idf['Statut'] = [installment_status(r['due_date'], r['amount_due'], r['amount_paid']) for _,r in idf.iterrows()]
@@ -4380,6 +4505,16 @@ elif page == "Emprunts":
                             st.rerun()
                         except Exception as exc:
                             st.error(str(exc))
+
+                st.divider()
+                delete_inst_confirm = st.checkbox("Je confirme la suppression définitive de cette échéance.", key=f"confirm_delete_installment_{installment_id}")
+                if st.button("🗑️ Supprimer cette échéance", key=f"delete_installment_{installment_id}", disabled=not delete_inst_confirm):
+                    try:
+                        delete_installment(installment_id)
+                        st.success("Échéance supprimée et statut du prêt recalculé.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Suppression impossible : {exc}")
 
                 total_due = float(pd.to_numeric(idf['amount_due'], errors='coerce').fillna(0).sum())
                 total_paid = float(pd.to_numeric(idf['amount_paid'], errors='coerce').fillna(0).sum())
