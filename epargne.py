@@ -1788,7 +1788,7 @@ def member_account_data_cached(member_id):
 
     member_df = read_sql(f"SELECT id, full_name, phone, monthly_target, notes, active, member_username, member_login_active, created_at FROM {mt} WHERE id=? LIMIT 1", [member_id])
     cdf = read_sql(f"SELECT c.id, c.member_id, m.full_name, c.payment_date, c.month_label, c.amount, c.note FROM {ct} c LEFT JOIN {mt} m ON m.id=c.member_id WHERE c.member_id=? ORDER BY c.payment_date DESC, c.id DESC", [member_id])
-    ldf = read_sql(f"SELECT l.id, l.member_id, m.full_name, l.loan_date, l.principal, l.interest_rate, l.total_due, l.duration_months, l.first_due_date, l.status, l.note FROM {lt} l LEFT JOIN {mt} m ON m.id=l.member_id WHERE l.member_id=? AND l.status='Confirmé' ORDER BY l.loan_date DESC, l.id DESC", [member_id])
+    ldf = read_sql(f"SELECT l.id, l.member_id, m.full_name, l.loan_date, l.principal, l.interest_rate, l.total_due, l.duration_months, l.first_due_date, l.status, l.note, l.admin_approval_reason, l.admin_approved, l.admin_approved_at FROM {lt} l LEFT JOIN {mt} m ON m.id=l.member_id WHERE l.member_id=? AND l.status='Confirmé' ORDER BY l.loan_date DESC, l.id DESC", [member_id])
     idf = read_sql(f"SELECT i.id, i.loan_id, i.installment_number, i.due_date, i.amount_due, i.amount_paid, i.payment_date, i.note FROM {it} i JOIN {lt} l ON l.id=i.loan_id WHERE l.member_id=? AND l.status='Confirmé' ORDER BY i.due_date, i.id", [member_id])
     rdf = read_sql(f"SELECT l.id, l.member_id, m.full_name, l.loan_date, l.principal, l.interest_rate, l.total_due, l.duration_months, l.first_due_date, l.status, l.note, l.admin_approval_reason, l.admin_approved_at FROM {lt} l LEFT JOIN {mt} m ON m.id=l.member_id WHERE l.member_id=? AND l.status IN ('Demande membre','Réserves administratives','Refusé','En attente de validation') ORDER BY l.loan_date DESC, l.id DESC", [member_id])
 
@@ -2028,14 +2028,36 @@ def member_account_page(member_id):
             st.info("Aucun emprunt confirmé.")
         else:
             st.dataframe(data["loans"], use_container_width=True, hide_index=True)
+
+            # L'avis administratif reste visible même après confirmation du prêt.
+            if "admin_approval_reason" in data["loans"].columns:
+                admin_loans = data["loans"][data["loans"]["admin_approval_reason"].fillna("").astype(str).str.strip() != ""]
+                if not admin_loans.empty:
+                    st.subheader("👤 Avis de l'administration")
+                    for _, loan in admin_loans.iterrows():
+                        reason = str(loan.get("admin_approval_reason") or "").strip()
+                        if not reason:
+                            continue
+                        if bool(loan.get("admin_approved") or False):
+                            st.success(f"**Emprunt #{int(loan['id'])} — Décision administrative :** {reason}")
+                        else:
+                            st.info(f"**Emprunt #{int(loan['id'])} — Avis / remarque administrative :** {reason}")
+                        if loan.get("admin_approved_at"):
+                            st.caption(f"Décision enregistrée le : {loan['admin_approved_at']}")
         if not data["requests"].empty:
             st.subheader("📨 État de mes demandes d'emprunt")
             for _, req in data["requests"].iterrows():
                 with st.container(border=True):
                     st.markdown(f"**Demande #{int(req['id'])} — {money(req['principal'])} — {req['status']}**")
                     st.caption(f"Soumise le : {req['loan_date']} · {int(req['duration_months'])} échéance(s)")
-                    if req.get("admin_approval_reason"):
-                        st.info(f"Administration : {req['admin_approval_reason']}")
+                    reason = str(req.get("admin_approval_reason") or "").strip()
+                    if reason:
+                        if str(req.get("status") or "") == "Refusé":
+                            st.error(f"👤 **Avis de l'administration :** {reason}")
+                        elif str(req.get("status") or "") == "Réserves administratives":
+                            st.warning(f"👤 **Réserves de l'administration :** {reason}")
+                        else:
+                            st.info(f"👤 **Avis de l'administration :** {reason}")
                     rdf = request_installments(int(req["id"]))
                     if not rdf.empty:
                         show = rdf.rename(columns={"installment_number":"Échéance #","due_date":"Date prévue","amount_due":"Somme prévue"})
@@ -2082,6 +2104,9 @@ def member_account_page(member_id):
         else:
             for _, req in current_requests.iterrows():
                 st.write(f"**#{int(req['id'])} — {money(req['principal'])} — {req['status']}**")
+                current_reason = str(req.get('admin_approval_reason') or '').strip()
+                if current_reason:
+                    st.caption(f"👤 Avis de l'administration : {current_reason}")
 
     with tab5:
         if reminders.empty:
