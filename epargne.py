@@ -1957,6 +1957,11 @@ def admin_review_member_loan_request(loan_id, decision, approval_action=None, ju
     if decision == "Approuvé" and approval_action not in {"Soumettre aux votes", "Approbation exceptionnelle"}:
         raise ValueError("Choisissez l'action à effectuer après l'approbation administrative.")
 
+    # Migration de sécurité juste avant toute écriture administrative.
+    # Cela corrige les bases Supabase créées avec une ancienne version du code,
+    # même si init_db() a déjà été mis en cache par Streamlit.
+    ensure_loan_admin_columns()
+
     lt, vt = _table("loans"), _table("loan_votes")
     with db() as con:
         row = con.execute(
