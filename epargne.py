@@ -741,6 +741,7 @@ def migrate_database(con):
             "admin_approved": "INTEGER DEFAULT 0",
             "admin_approval_reason": "TEXT",
             "admin_approved_at": "TEXT",
+            "admin_approval_mode": "TEXT",
         },
         "loan_installments": {
             "installment_number": "INTEGER DEFAULT 1",
@@ -895,6 +896,7 @@ def create_supabase_schema():
                 admin_approved BOOLEAN NOT NULL DEFAULT FALSE,
                 admin_approval_reason TEXT,
                 admin_approved_at TIMESTAMPTZ,
+                admin_approval_mode TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """,
@@ -1014,6 +1016,7 @@ def create_supabase_schema():
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approved BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approval_reason TEXT",
             "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approved_at TIMESTAMPTZ",
+            "ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approval_mode TEXT",
 
             # loan_installments
             "ALTER TABLE public.loan_installments ADD COLUMN IF NOT EXISTS loan_id BIGINT",
@@ -1376,6 +1379,7 @@ def ensure_loan_admin_columns():
             con.execute("ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approved BOOLEAN NOT NULL DEFAULT FALSE")
             con.execute("ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approval_reason TEXT")
             con.execute("ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approved_at TIMESTAMPTZ")
+            con.execute("ALTER TABLE public.loans ADD COLUMN IF NOT EXISTS admin_approval_mode TEXT")
             con.execute("UPDATE public.loans SET admin_approved=FALSE WHERE admin_approved IS NULL")
             con.commit()
     else:
@@ -1387,6 +1391,8 @@ def ensure_loan_admin_columns():
                 con.execute("ALTER TABLE loans ADD COLUMN admin_approval_reason TEXT")
             if "admin_approved_at" not in existing:
                 con.execute("ALTER TABLE loans ADD COLUMN admin_approved_at TEXT")
+            if "admin_approval_mode" not in existing:
+                con.execute("ALTER TABLE loans ADD COLUMN admin_approval_mode TEXT")
             con.execute("UPDATE loans SET admin_approved=0 WHERE admin_approved IS NULL")
             con.commit()
 
@@ -1790,7 +1796,7 @@ def member_account_data_cached(member_id):
     cdf = read_sql(f"SELECT c.id, c.member_id, m.full_name, c.payment_date, c.month_label, c.amount, c.note FROM {ct} c LEFT JOIN {mt} m ON m.id=c.member_id WHERE c.member_id=? ORDER BY c.payment_date DESC, c.id DESC", [member_id])
     ldf = read_sql(f"SELECT l.id, l.member_id, m.full_name, l.loan_date, l.principal, l.interest_rate, l.total_due, l.duration_months, l.first_due_date, l.status, l.note, l.admin_approval_reason, l.admin_approved, l.admin_approved_at FROM {lt} l LEFT JOIN {mt} m ON m.id=l.member_id WHERE l.member_id=? AND l.status='Confirmé' ORDER BY l.loan_date DESC, l.id DESC", [member_id])
     idf = read_sql(f"SELECT i.id, i.loan_id, i.installment_number, i.due_date, i.amount_due, i.amount_paid, i.payment_date, i.note FROM {it} i JOIN {lt} l ON l.id=i.loan_id WHERE l.member_id=? AND l.status='Confirmé' ORDER BY i.due_date, i.id", [member_id])
-    rdf = read_sql(f"SELECT l.id, l.member_id, m.full_name, l.loan_date, l.principal, l.interest_rate, l.total_due, l.duration_months, l.first_due_date, l.status, l.note, l.admin_approval_reason, l.admin_approved_at FROM {lt} l LEFT JOIN {mt} m ON m.id=l.member_id WHERE l.member_id=? AND l.status IN ('Demande membre','Réserves administratives','Refusé','En attente de validation') ORDER BY l.loan_date DESC, l.id DESC", [member_id])
+    rdf = read_sql(f"SELECT l.id, l.member_id, m.full_name, l.loan_date, l.principal, l.interest_rate, l.total_due, l.duration_months, l.first_due_date, l.status, l.note, l.admin_approval_reason, l.admin_approved_at FROM {lt} l LEFT JOIN {mt} m ON m.id=l.member_id WHERE l.member_id=? AND l.status IN ('Demande membre','Refusé','En attente de validation','Bloqué par un veto') ORDER BY l.loan_date DESC, l.id DESC", [member_id])
 
     cdf = _clean_contributions_df(cdf)
     for col in ('amount_due','amount_paid'):
@@ -1921,7 +1927,7 @@ def member_loan_requests(member_id=None):
                        l.duration_months,l.first_due_date,l.status,l.note,
                        l.admin_approval_reason,l.admin_approved_at
                 FROM {lt} l JOIN {mt} m ON m.id=l.member_id
-                WHERE l.status IN ('Demande membre','Réserves administratives','Refusé','En attente de validation')"""
+                WHERE l.status IN ('Demande membre','Bloqué par un veto')"""
     params = []
     if member_id is not None:
         query += " AND l.member_id=?"
@@ -1930,60 +1936,100 @@ def member_loan_requests(member_id=None):
     return read_sql(query, params)
 
 
-def admin_review_member_loan_request(loan_id, decision, reservation=""):
-    """Traite une demande membre : soumission aux votes, réserves/refus ou confirmation directe."""
+def admin_review_member_loan_request(loan_id, decision, approval_action=None, justification=""):
+    """
+    Applique la nouvelle chaîne de décision administrative.
+
+    Décision administrative :
+      - Désapprouvé -> justification obligatoire -> Refusé définitif.
+      - Approuvé -> soit Soumettre aux votes, soit Approbation exceptionnelle.
+
+    Les bulletins de vote ne sont créés que lors d'une vraie soumission aux votes.
+    """
     loan_id = safe_int_id(loan_id)
     decision = str(decision or "").strip()
-    reservation = str(reservation or "").strip()
+    approval_action = str(approval_action or "").strip()
+    justification = str(justification or "").strip()
     if loan_id is None:
         raise ValueError("Demande invalide.")
-    allowed = {"Soumettre aux votes", "Mettre en réserve", "Refuser", "Confirmer directement"}
-    if decision not in allowed:
+    if decision not in {"Désapprouvé", "Approuvé"}:
         raise ValueError("Décision administrative invalide.")
-    lt = _table("loans")
+    if decision == "Approuvé" and approval_action not in {"Soumettre aux votes", "Approbation exceptionnelle"}:
+        raise ValueError("Choisissez l'action à effectuer après l'approbation administrative.")
+
+    lt, vt = _table("loans"), _table("loan_votes")
     with db() as con:
-        row = con.execute(f"SELECT id,status FROM {lt} WHERE id=? LIMIT 1", (loan_id,)).fetchone()
+        row = con.execute(
+            f"SELECT id,status FROM {lt} WHERE id=? LIMIT 1", (loan_id,)
+        ).fetchone()
         if not row:
             raise ValueError("Demande introuvable.")
-        if str(row["status"]) not in {"Demande membre", "Réserves administratives"}:
-            raise ValueError("Cette demande a déjà été traitée.")
-        if decision in {"Mettre en réserve", "Refuser", "Confirmer directement"} and not reservation:
-            raise ValueError("Indiquez une remarque ou une réserve administrative.")
+        current_status = str(row["status"] or "")
+        if current_status not in {"Demande membre", "Bloqué par un veto"}:
+            raise ValueError("Cette demande n'est plus disponible pour une décision administrative.")
 
-        if decision == "Soumettre aux votes":
+        if decision == "Désapprouvé":
+            if not justification:
+                raise ValueError("La justification est obligatoire pour une décision désapprouvée.")
             con.execute(
-                f"UPDATE {lt} SET status='En attente de validation', admin_approval_reason=?, admin_approved=FALSE, admin_approved_at=NULL WHERE id=?",
-                (reservation or "Demande validée par l'administration et soumise aux membres.", loan_id),
+                f"""UPDATE {lt}
+                    SET status='Refusé', admin_approved=FALSE,
+                        admin_approval_reason=?, admin_approved_at={"NOW()" if use_supabase() else "datetime('now')"},
+                        admin_approval_mode='desapprouve'
+                    WHERE id=?""",
+                (justification, loan_id),
             )
-        elif decision == "Mettre en réserve":
-            con.execute(
-                f"UPDATE {lt} SET status='Réserves administratives', admin_approval_reason=?, admin_approved=FALSE, admin_approved_at=NULL WHERE id=?",
-                (reservation, loan_id),
-            )
-        elif decision == "Refuser":
-            con.execute(
-                f"UPDATE {lt} SET status='Refusé', admin_approval_reason=?, admin_approved=FALSE, admin_approved_at=NULL WHERE id=?",
-                (reservation, loan_id),
-            )
-        else:
+        elif approval_action == "Approbation exceptionnelle":
+            if not justification:
+                raise ValueError("Le motif est obligatoire pour une approbation exceptionnelle.")
             if use_supabase():
                 con.execute(
-                    f"UPDATE {lt} SET status='Confirmé', admin_approved=TRUE, admin_approval_reason=?, admin_approved_at=NOW() WHERE id=?",
-                    (reservation, loan_id),
+                    f"""UPDATE {lt}
+                        SET status='Confirmé', admin_approved=TRUE,
+                            admin_approval_reason=?, admin_approved_at=NOW(),
+                            admin_approval_mode='exceptionnelle'
+                        WHERE id=?""",
+                    (justification, loan_id),
                 )
             else:
                 con.execute(
-                    f"UPDATE {lt} SET status='Confirmé', admin_approved=1, admin_approval_reason=?, admin_approved_at=datetime('now') WHERE id=?",
-                    (reservation, loan_id),
+                    f"""UPDATE {lt}
+                        SET status='Confirmé', admin_approved=1,
+                            admin_approval_reason=?, admin_approved_at=datetime('now'),
+                            admin_approval_mode='exceptionnelle'
+                        WHERE id=?""",
+                    (justification, loan_id),
                 )
+        else:
+            # Approbation administrative + seconde validation par les membres.
+            if use_supabase():
+                con.execute(
+                    f"""UPDATE {lt}
+                        SET status='En attente de validation', admin_approved=TRUE,
+                            admin_approval_reason=?, admin_approved_at=NOW(),
+                            admin_approval_mode='votes'
+                        WHERE id=?""",
+                    (justification or "Demande approuvée par l'administration et soumise aux votes.", loan_id),
+                )
+                # Une nouvelle soumission après veto constitue un nouveau tour de vote.
+                con.execute(f"DELETE FROM {vt} WHERE loan_id=?", (loan_id,))
+            else:
+                con.execute(
+                    f"""UPDATE {lt}
+                        SET status='En attente de validation', admin_approved=1,
+                            admin_approval_reason=?, admin_approved_at=datetime('now'),
+                            admin_approval_mode='votes'
+                        WHERE id=?""",
+                    (justification or "Demande approuvée par l'administration et soumise aux votes.", loan_id),
+                )
+                con.execute(f"DELETE FROM {vt} WHERE loan_id=?", (loan_id,))
         con.commit()
-    if decision == "Soumettre aux votes":
+
+    if decision == "Approuvé" and approval_action == "Soumettre aux votes":
+        # C'est le seul endroit du circuit administratif qui crée les bulletins.
         ensure_loan_votes(loan_id)
-        _, status = loan_vote_status(loan_id)
-        with db() as con:
-            con.execute(f"UPDATE {lt} SET status=? WHERE id=?", (status, loan_id))
-            con.commit()
     refresh_application_data()
+
 
 
 def request_installments(loan_id):
@@ -2054,8 +2100,6 @@ def member_account_page(member_id):
                     if reason:
                         if str(req.get("status") or "") == "Refusé":
                             st.error(f"👤 **Avis de l'administration :** {reason}")
-                        elif str(req.get("status") or "") == "Réserves administratives":
-                            st.warning(f"👤 **Réserves de l'administration :** {reason}")
                         else:
                             st.info(f"👤 **Avis de l'administration :** {reason}")
                     rdf = request_installments(int(req["id"]))
@@ -2284,10 +2328,6 @@ def refresh_application_data():
     """Force Streamlit à relire les données Supabase immédiatement."""
     try:
         member_account_data_cached.clear()
-    except Exception:
-        pass
-    try:
-        st.cache_data.clear()
     except Exception:
         pass
 
@@ -2680,11 +2720,8 @@ def create_loan(
         verify = con.execute(f"SELECT id FROM {loan_table} WHERE id=? LIMIT 1", (loan_id,)).fetchone()
         if not verify:
             raise RuntimeError('La base n’a pas confirmé le prêt.')
-    ensure_loan_votes(loan_id)
-    _, vote_status = loan_vote_status(loan_id)
-    with db() as con:
-        con.execute(f"UPDATE {loan_table} SET status=? WHERE id=?", (vote_status, loan_id))
-        con.commit()
+    # Un prêt créé directement par l'administration reste un prêt administratif
+    # classique. Aucun bulletin n'est créé implicitement.
     refresh_application_data()
     return loan_id
 
@@ -3016,7 +3053,7 @@ def send_admin_message_to_member(member_id, subject, message, message_type="mess
 
 
 def ensure_loan_votes(loan_id):
-    """Crée un bulletin pour chaque autre membre actif."""
+    """Crée les bulletins uniquement pour une demande réellement soumise aux votes."""
     loan_id = safe_int_id(loan_id)
     if loan_id is None:
         return
@@ -3026,40 +3063,44 @@ def ensure_loan_votes(loan_id):
         if not loan:
             return
         borrower_id = safe_int_id(loan["member_id"])
-        members = con.execute(
-            f"SELECT id FROM {mt} WHERE active=TRUE AND id<>?", (borrower_id,)
-        ).fetchall()
-        for row in members:
-            if use_supabase():
-                con.execute(
-                    f"""INSERT INTO {vt}(loan_id, voter_member_id, decision)
-                        VALUES (?, ?, 'En attente')
-                        ON CONFLICT (loan_id, voter_member_id) DO NOTHING""",
-                    (loan_id, safe_int_id(row["id"])),
-                )
-            else:
-                con.execute(
-                    f"""INSERT OR IGNORE INTO {vt}(loan_id, voter_member_id, decision)
-                        VALUES (?, ?, 'En attente')""",
-                    (loan_id, safe_int_id(row["id"])),
-                )
+        if borrower_id is None:
+            return
+        # Une seule requête d'insertion en masse au lieu d'une requête par membre.
+        if use_supabase():
+            con.execute(
+                f"""INSERT INTO {vt}(loan_id, voter_member_id, decision)
+                    SELECT ?, m.id, 'En attente'
+                    FROM {mt} m
+                    WHERE m.active IS TRUE AND m.id<>?
+                    ON CONFLICT (loan_id, voter_member_id) DO NOTHING""",
+                (loan_id, borrower_id),
+            )
+        else:
+            con.execute(
+                f"""INSERT OR IGNORE INTO {vt}(loan_id, voter_member_id, decision)
+                    SELECT ?, m.id, 'En attente'
+                    FROM {mt} m
+                    WHERE COALESCE(m.active,1)=1 AND m.id<>?""",
+                (loan_id, borrower_id),
+            )
         con.commit()
 
 
-def loan_vote_status(loan_id):
-    """Détermine le statut d'un prêt selon les votes ou une décision administrative exceptionnelle.
 
-    Règle normale : tous les autres membres actifs doivent approuver et un seul veto bloque.
-    Exception : un administrateur peut confirmer explicitement le prêt en cas de conflit,
-    même si les votes sont incomplets ou contiennent un veto.
+def loan_vote_status(loan_id):
+    """Lit uniquement les votes existants et calcule leur résultat.
+
+    Aucun bulletin n'est créé ici : cela évite toute requête/écriture implicite
+    lors de l'affichage d'un prêt. Une approbation administrative classique
+    (mode ``votes``) ne contourne jamais la seconde validation des membres.
     """
-    ensure_loan_admin_columns()
     loan_id = safe_int_id(loan_id)
-    ensure_loan_votes(loan_id)
+    if loan_id is None:
+        return pd.DataFrame(), "En attente de validation"
     vt, mt, lt = _table("loan_votes"), _table("members"), _table("loans")
     with db() as con:
-        loan_override = con.execute(
-            f"SELECT COALESCE(admin_approved, FALSE) AS admin_approved FROM {lt} WHERE id=?",
+        loan = con.execute(
+            f"SELECT COALESCE(admin_approved,FALSE) AS admin_approved, admin_approval_mode FROM {lt} WHERE id=?",
             (loan_id,),
         ).fetchone()
         rows = con.execute(
@@ -3075,7 +3116,7 @@ def loan_vote_status(loan_id):
     df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame(
         columns=["id","loan_id","voter_member_id","voter_name","decision","comment","created_at"]
     )
-    if loan_override and bool(loan_override["admin_approved"]):
+    if loan and bool(loan["admin_approved"]) and str(loan["admin_approval_mode"] or "") == "exceptionnelle":
         return df, "Confirmé par l'administration"
 
     total = len(df)
@@ -3091,6 +3132,7 @@ def loan_vote_status(loan_id):
     return df, status
 
 
+
 def cast_loan_vote(loan_id, voter_member_id, decision, comment=""):
     loan_id = safe_int_id(loan_id)
     voter_member_id = safe_int_id(voter_member_id)
@@ -3101,9 +3143,14 @@ def cast_loan_vote(loan_id, voter_member_id, decision, comment=""):
         raise ValueError("Prêt ou membre invalide.")
     lt, mt, vt = _table("loans"), _table("members"), _table("loan_votes")
     with db() as con:
-        loan = con.execute(f"SELECT member_id FROM {lt} WHERE id=?", (loan_id,)).fetchone()
+        loan = con.execute(
+            f"SELECT member_id, status, admin_approved, admin_approval_mode FROM {lt} WHERE id=?",
+            (loan_id,),
+        ).fetchone()
         if not loan:
             raise ValueError("Prêt introuvable.")
+        if str(loan["status"] or "") not in {"En attente de validation", "Bloqué par un veto"} or str(loan["admin_approval_mode"] or "") != "votes":
+            raise ValueError("Ce prêt n'est pas actuellement soumis aux votes des membres.")
         if safe_int_id(loan["member_id"]) == voter_member_id:
             raise ValueError("Le bénéficiaire du prêt ne peut pas voter sur son propre prêt.")
         voter = con.execute(
@@ -3164,6 +3211,7 @@ def admin_approve_loan(loan_id, reason=""):
                     SET admin_approved=TRUE,
                         admin_approval_reason=?,
                         admin_approved_at=NOW(),
+                        admin_approval_mode='exceptionnelle',
                         status='Confirmé'
                     WHERE id=?""",
                 (reason, loan_id),
@@ -3174,6 +3222,7 @@ def admin_approve_loan(loan_id, reason=""):
                     SET admin_approved=1,
                         admin_approval_reason=?,
                         admin_approved_at=datetime('now'),
+                        admin_approval_mode='exceptionnelle',
                         status='Confirmé'
                     WHERE id=?""",
                 (reason, loan_id),
@@ -3194,7 +3243,7 @@ def revoke_admin_loan_approval(loan_id):
         if not loan:
             raise ValueError("Prêt introuvable.")
         con.execute(
-            f"UPDATE {lt} SET admin_approved=FALSE, admin_approval_reason=NULL, admin_approved_at=NULL WHERE id=?",
+            f"UPDATE {lt} SET admin_approved=FALSE, admin_approval_reason=NULL, admin_approved_at=NULL, admin_approval_mode=NULL WHERE id=?",
             (loan_id,),
         )
         con.commit()
@@ -3204,6 +3253,27 @@ def revoke_admin_loan_approval(loan_id):
         con.commit()
     refresh_application_data()
     return status
+
+
+def loan_vote_summaries():
+    """Retourne les synthèses de vote en une seule requête.
+
+    Les prêts Confirmé/Actif/Remboursé ne sont volontairement pas interrogés.
+    """
+    lt, mt, vt = _table("loans"), _table("members"), _table("loan_votes")
+    return read_sql(
+        f"""SELECT l.id AS loan_id, l.member_id, m.full_name, l.principal, l.status,
+                   COUNT(lv.id) AS total_votes,
+                   COALESCE(SUM(CASE WHEN lv.decision='Approuvé' THEN 1 ELSE 0 END),0) AS approvals,
+                   COALESCE(SUM(CASE WHEN lv.decision='Veto' THEN 1 ELSE 0 END),0) AS vetoes,
+                   COALESCE(SUM(CASE WHEN lv.decision='En attente' THEN 1 ELSE 0 END),0) AS pending
+            FROM {lt} l
+            LEFT JOIN {mt} m ON m.id=l.member_id
+            LEFT JOIN {vt} lv ON lv.loan_id=l.id
+            WHERE l.status IN ('En attente de validation','Bloqué par un veto')
+            GROUP BY l.id, l.member_id, m.full_name, l.principal, l.status
+            ORDER BY l.loan_date DESC, l.id DESC"""
+    )
 
 
 def loan_votes_for_member(member_id):
@@ -4110,25 +4180,6 @@ except Exception:
     st.info("Vérifiez la configuration Supabase et redémarrez l'application.")
     st.stop()
 
-# Les prêts déjà présents reçoivent également leur bulletin de vote.
-try:
-    ensure_loan_admin_columns()
-    existing_loans = loans()
-    for _lid in existing_loans["id"].tolist() if not existing_loans.empty else []:
-        ensure_loan_votes(_lid)
-        _vdf, _vstatus = loan_vote_status(_lid)
-        _ltable = _table("loans")
-        with db() as _con:
-            _override = _con.execute(
-                f"SELECT COALESCE(admin_approved, FALSE) AS admin_approved FROM {_ltable} WHERE id=?",
-                (_lid,),
-            ).fetchone()
-            _final_status = "Confirmé" if (_override and bool(_override["admin_approved"])) else _vstatus
-            _con.execute(f"UPDATE {_ltable} SET status=? WHERE id=?", (_final_status, _lid))
-            _con.commit()
-except Exception:
-    pass
-
 if "user" not in st.session_state:
     st.session_state.user = None
 
@@ -4713,7 +4764,7 @@ elif page == "Emprunts":
             if submit:
                 try:
                     create_loan(member_id, loan_date, principal, rate, duration, first_due_date, note)
-                    st.success("Prêt enregistré. Il est maintenant soumis aux votes des autres membres actifs.")
+                    st.success("Prêt enregistré directement par l'administration. Aucun vote n'est créé automatiquement.")
                     st.rerun()
                 except Exception as exc:
                     st.error(str(exc))
@@ -4744,26 +4795,55 @@ elif page == "Emprunts":
             with st.form(f"admin_review_member_request_form_{selected_request_id}"):
                 review_decision = st.selectbox(
                     "Décision administrative",
-                    ["Soumettre aux votes", "Mettre en réserve", "Refuser", "Confirmer directement"],
+                    ["Désapprouvé", "Approuvé"],
                     key=f"admin_review_decision_{selected_request_id}"
                 )
+                if review_decision == "Approuvé":
+                    review_action = st.radio(
+                        "Après l'approbation",
+                        ["Soumettre aux votes", "Approbation exceptionnelle"],
+                        horizontal=True,
+                        key=f"admin_review_action_{selected_request_id}"
+                    )
+                    note_label = (
+                        "Motif de l'approbation exceptionnelle (obligatoire)"
+                        if review_action == "Approbation exceptionnelle"
+                        else "Justification / remarque administrative (facultative)"
+                    )
+                else:
+                    review_action = None
+                    note_label = "Justification du désapprouvé — obligatoire"
+
                 review_note = st.text_area(
-                    "Réserves / remarques / conditions de l'administration",
-                    value=str(request_row.get('admin_approval_reason') or ''),
-                    placeholder="Ex. modifier la date, réduire le montant, préciser une condition…",
+                    note_label,
+                    value="",
+                    placeholder=(
+                        "Expliquez obligatoirement la décision de désapprobation…"
+                        if review_decision == "Désapprouvé"
+                        else "Motif, condition ou remarque administrative…"
+                    ),
                     height=100,
                     key=f"admin_review_note_{selected_request_id}"
                 )
                 review_submit = st.form_submit_button("💾 Enregistrer la décision", type="primary")
                 if review_submit:
                     try:
-                        admin_review_member_loan_request(selected_request_id, review_decision, review_note)
-                        st.success("Décision administrative enregistrée.")
+                        admin_review_member_loan_request(
+                            selected_request_id, review_decision, review_action, review_note
+                        )
+                        if review_decision == "Désapprouvé":
+                            st.success("Demande désapprouvée : elle est définitivement refusée.")
+                        elif review_action == "Soumettre aux votes":
+                            st.success("Demande approuvée par l'administration et soumise aux votes des membres.")
+                        else:
+                            st.success("Prêt confirmé par approbation administrative exceptionnelle.")
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
 
-            st.caption("Après « Soumettre aux votes », le prêt rejoint le circuit de validation/veto déjà présent dans l'application. « Confirmer directement » utilise la décision administrative exceptionnelle existante.")
+            if str(request_row.get("status") or "") == "Bloqué par un veto":
+                st.warning("🛑 Cette demande a été bloquée par un veto. Elle reste ici afin que l'administration puisse prendre une décision explicite.")
+            st.caption("Désapprouvé = refus définitif. Approuvé = seconde validation par les membres ou approbation exceptionnelle immédiate.")
 
         st.divider()
         ldf = loans()
@@ -4772,83 +4852,19 @@ elif page == "Emprunts":
 
         if not ldf.empty:
             st.subheader("🗳️ État des validations / vetos")
-            vote_rows = []
-            for _, loan in ldf.iterrows():
-                lid = safe_int_id(loan.get("id"))
-                if lid is None:
-                    continue
-                vdf, vstatus = loan_vote_status(lid)
-                vote_rows.append({
-                    "Prêt": lid,
-                    "Bénéficiaire": loan.get("full_name", ""),
-                    "Montant": money(loan.get("principal", 0)),
-                    "Statut": vstatus,
-                    "Approuvés": int((vdf["decision"] == "Approuvé").sum()) if not vdf.empty else 0,
-                    "Vetos": int((vdf["decision"] == "Veto").sum()) if not vdf.empty else 0,
-                    "En attente": int((vdf["decision"] == "En attente").sum()) if not vdf.empty else 0,
-                })
-            st.dataframe(pd.DataFrame(vote_rows), use_container_width=True, hide_index=True)
-
-        if not ldf.empty:
-            st.subheader("🛡️ Approbation exceptionnelle par l'administration")
-            st.caption(
-                "En cas de conflit, l'administrateur peut confirmer exceptionnellement un prêt. "
-                "Cette décision prime sur les vetos et les votes incomplets et reste enregistrée dans la base."
-            )
-            admin_loan_options = {
-                f"#{safe_int_id(r['id'])} — {r['full_name']} — {money(r['principal'])} — {r.get('status', '')}": safe_int_id(r['id'])
-                for _, r in ldf.iterrows() if safe_int_id(r.get('id')) is not None
-            }
-            admin_selected_label = st.selectbox(
-                "Prêt concerné par la décision administrative",
-                list(admin_loan_options.keys()),
-                key="admin_exceptional_loan_select",
-            )
-            admin_selected_loan = admin_loan_options[admin_selected_label]
-            _vdf_admin, _vstatus_admin = loan_vote_status(admin_selected_loan)
-            _ltable_admin = _table("loans")
-            with db() as _con_admin:
-                _admin_row = _con_admin.execute(
-                    f"SELECT COALESCE(admin_approved, FALSE) AS admin_approved, admin_approval_reason, admin_approved_at FROM {_ltable_admin} WHERE id=?",
-                    (admin_selected_loan,),
-                ).fetchone()
-            _already_admin = bool(_admin_row and _admin_row["admin_approved"])
-            if _already_admin:
-                st.success("✅ Ce prêt bénéficie déjà d'une approbation administrative exceptionnelle.")
-                if _admin_row["admin_approval_reason"]:
-                    st.info(f"Motif enregistré : {_admin_row['admin_approval_reason']}")
-                if st.button("↩️ Retirer l'approbation administrative", key=f"revoke_admin_loan_{admin_selected_loan}"):
-                    try:
-                        revoke_admin_loan_approval(admin_selected_loan)
-                        st.success("Approbation administrative retirée ; le statut a été recalculé selon les votes.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(str(exc))
+            vote_summary = loan_vote_summaries()
+            if vote_summary.empty:
+                st.info("Aucun prêt n'est actuellement dans le circuit de vote.")
             else:
-                st.warning(
-                    f"Statut actuel : {_vstatus_admin}. Cette action peut confirmer le prêt même en présence d'un veto."
+                vote_summary["Montant"] = vote_summary["principal"].map(money)
+                vote_summary = vote_summary.rename(columns={
+                    "loan_id":"Prêt", "full_name":"Bénéficiaire", "status":"Statut",
+                    "approvals":"Approuvés", "vetoes":"Vetos", "pending":"En attente"
+                })
+                st.dataframe(
+                    vote_summary[["Prêt","Bénéficiaire","Montant","Statut","Approuvés","Vetos","En attente"]],
+                    use_container_width=True, hide_index=True
                 )
-                with st.form(f"admin_exceptional_approval_form_{admin_selected_loan}"):
-                    admin_reason = st.text_area(
-                        "Motif obligatoire de la décision administrative",
-                        placeholder="Ex. conflit entre votants, situation exceptionnelle, décision de la commission…",
-                        height=100,
-                    )
-                    admin_confirm = st.checkbox(
-                        "Je confirme que cette approbation administrative exceptionnelle est volontaire.",
-                        key=f"admin_exceptional_confirm_{admin_selected_loan}",
-                    )
-                    admin_submit = st.form_submit_button("🛡️ Confirmer exceptionnellement le prêt", type="primary")
-                    if admin_submit:
-                        if not admin_confirm:
-                            st.error("Cochez la confirmation avant d'enregistrer la décision.")
-                        else:
-                            try:
-                                admin_approve_loan(admin_selected_loan, admin_reason)
-                                st.success("Prêt confirmé exceptionnellement par l'administration.")
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(str(exc))
 
         if not ldf.empty:
             loan_options = {f"#{safe_int_id(r['id'])} — {r['full_name']} — {money(r['principal'])}": safe_int_id(r['id']) for _,r in ldf.iterrows() if safe_int_id(r.get('id')) is not None}
