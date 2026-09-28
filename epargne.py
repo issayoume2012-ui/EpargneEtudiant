@@ -1790,6 +1790,7 @@ def member_account_data_cached(member_id):
     cdf = read_sql(f"SELECT c.id, c.member_id, m.full_name, c.payment_date, c.month_label, c.amount, c.note FROM {ct} c LEFT JOIN {mt} m ON m.id=c.member_id WHERE c.member_id=? ORDER BY c.payment_date DESC, c.id DESC", [member_id])
     ldf = read_sql(f"SELECT l.id, l.member_id, m.full_name, l.loan_date, l.principal, l.interest_rate, l.total_due, l.duration_months, l.first_due_date, l.status, l.note FROM {lt} l LEFT JOIN {mt} m ON m.id=l.member_id WHERE l.member_id=? AND l.status='Confirmé' ORDER BY l.loan_date DESC, l.id DESC", [member_id])
     idf = read_sql(f"SELECT i.id, i.loan_id, i.installment_number, i.due_date, i.amount_due, i.amount_paid, i.payment_date, i.note FROM {it} i JOIN {lt} l ON l.id=i.loan_id WHERE l.member_id=? AND l.status='Confirmé' ORDER BY i.due_date, i.id", [member_id])
+    rdf = read_sql(f"SELECT l.id, l.member_id, m.full_name, l.loan_date, l.principal, l.interest_rate, l.total_due, l.duration_months, l.first_due_date, l.status, l.note, l.admin_approval_reason, l.admin_approved_at FROM {lt} l LEFT JOIN {mt} m ON m.id=l.member_id WHERE l.member_id=? AND l.status IN ('Demande membre','Réserves administratives','Refusé','En attente de validation') ORDER BY l.loan_date DESC, l.id DESC", [member_id])
 
     cdf = _clean_contributions_df(cdf)
     for col in ('amount_due','amount_paid'):
@@ -1803,7 +1804,7 @@ def member_account_data_cached(member_id):
     total_received = float(pd.to_numeric(idf.get('amount_paid', pd.Series(dtype=float)), errors='coerce').fillna(0).sum())
     total_due = float(pd.to_numeric(idf.get('amount_due', pd.Series(dtype=float)), errors='coerce').fillna(0).sum())
 
-    return {'member': member_df, 'contributions': cdf, 'loans': ldf, 'installments': idf,
+    return {'member': member_df, 'contributions': cdf, 'loans': ldf, 'installments': idf, 'requests': rdf,
             'total_contributed': total_contributed, 'total_borrowed': total_borrowed,
             'total_received': total_received, 'outstanding': max(total_due-total_received,0)}
 
@@ -1811,37 +1812,278 @@ def member_account_data(member_id):
     """Retourne uniquement les données du membre authentifié."""
     return member_account_data_cached(int(member_id))
 
+def monthly_contribution_status(member_id):
+    """Retourne l'état de la cotisation mensuelle du membre pour le mois courant."""
+    member_id = safe_int_id(member_id)
+    if member_id is None:
+        return {"status": "Inconnu", "target": 0.0, "paid": 0.0, "month": month_label(date.today())}
+    mt, ct = _table("members"), _table("contributions")
+    with db() as con:
+        row = con.execute(
+            f"SELECT monthly_target FROM {mt} WHERE id=? LIMIT 1", (member_id,)
+        ).fetchone()
+        target = float(row["monthly_target"] or 0) if row else 0.0
+        paid_row = con.execute(
+            f"""SELECT COALESCE(SUM(amount),0) AS paid
+                FROM {ct}
+                WHERE member_id=?
+                  AND payment_date >= ?
+                  AND payment_date < ?""",
+            (member_id, date.today().replace(day=1).isoformat(),
+             add_months(date.today().replace(day=1), 1).isoformat()),
+        ).fetchone()
+        paid = float(paid_row["paid"] or 0) if paid_row else 0.0
+    if target <= 0:
+        status = "Objectif non défini"
+    elif paid + 0.01 >= target:
+        status = "À jour"
+    else:
+        status = "Non à jour"
+    return {"status": status, "target": target, "paid": paid, "month": month_label(date.today())}
+
+
+def submit_member_loan_request(member_id, loan_date, principal, installments, note=""):
+    """Crée une demande d'emprunt proposée par le membre avec son échéancier."""
+    member_id = safe_int_id(member_id)
+    principal = float(principal)
+    if member_id is None:
+        raise ValueError("Membre invalide.")
+    if principal <= 0:
+        raise ValueError("Le montant demandé doit être supérieur à 0.")
+    if not installments or len(installments) > 60:
+        raise ValueError("La demande doit comporter entre 1 et 60 échéances.")
+
+    normalized = []
+    total = 0.0
+    for idx, item in enumerate(installments, start=1):
+        due_date = item.get("due_date")
+        amount = float(item.get("amount", 0) or 0)
+        if not due_date or amount <= 0:
+            raise ValueError(f"L'échéance #{idx} est invalide.")
+        normalized.append((idx, due_date, amount))
+        total += amount
+    if abs(total - principal) > 0.05:
+        raise ValueError(
+            f"La somme des échéances ({money(total)}) doit être égale au montant demandé ({money(principal)})."
+        )
+
+    lt, it, mt = _table("loans"), _table("loan_installments"), _table("members")
+    first_due = normalized[0][1]
+    with db() as con:
+        active_clause = "COALESCE(active, TRUE)=TRUE" if use_supabase() else "COALESCE(active, 1)=1"
+        member = con.execute(
+            f"SELECT id FROM {mt} WHERE id=? AND {active_clause} LIMIT 1", (member_id,)
+        ).fetchone()
+        if not member:
+            raise ValueError("Votre compte membre n'est pas actif.")
+
+        if use_supabase():
+            cur = con.execute(
+                f"""INSERT INTO {lt}
+                    (member_id, loan_date, principal, interest_rate, total_due,
+                     duration_months, first_due_date, status, note,
+                     total_interest_rate, installments_count, admin_approved,
+                     admin_approval_reason, admin_approved_at)
+                    VALUES (?, ?, ?, 0, ?, ?, ?, 'Demande membre', ?, 0, ?, FALSE, NULL, NULL)
+                    RETURNING id""",
+                (member_id, loan_date.isoformat(), principal, principal, len(normalized),
+                 first_due.isoformat(), str(note or '').strip(), len(normalized)),
+            )
+            row = cur.fetchone()
+            loan_id = safe_int_id(row["id"]) if row else None
+        else:
+            cur = con.execute(
+                f"""INSERT INTO {lt}
+                    (member_id, loan_date, principal, interest_rate, total_due,
+                     duration_months, first_due_date, status, note,
+                     admin_approved, admin_approval_reason, admin_approved_at)
+                    VALUES (?, ?, ?, 0, ?, ?, ?, 'Demande membre', ?, 0, NULL, NULL)""",
+                (member_id, loan_date.isoformat(), principal, principal, len(normalized),
+                 first_due.isoformat(), str(note or '').strip()),
+            )
+            loan_id = safe_int_id(cur.lastrowid)
+        if loan_id is None:
+            raise RuntimeError("Impossible de créer la demande d'emprunt.")
+        for idx, due_date, amount in normalized:
+            con.execute(
+                f"INSERT INTO {it}(loan_id, installment_number, due_date, amount_due, amount_paid) VALUES (?, ?, ?, ?, 0)",
+                (loan_id, idx, due_date.isoformat(), round(amount, 2)),
+            )
+        con.commit()
+    refresh_application_data()
+    return loan_id
+
+
+def member_loan_requests(member_id=None):
+    """Liste les demandes d'emprunt qui ne sont pas encore des prêts confirmés."""
+    lt, mt = _table("loans"), _table("members")
+    query = f"""SELECT l.id,l.member_id,m.full_name,l.loan_date,l.principal,l.total_due,
+                       l.duration_months,l.first_due_date,l.status,l.note,
+                       l.admin_approval_reason,l.admin_approved_at
+                FROM {lt} l JOIN {mt} m ON m.id=l.member_id
+                WHERE l.status IN ('Demande membre','Réserves administratives','Refusé','En attente de validation')"""
+    params = []
+    if member_id is not None:
+        query += " AND l.member_id=?"
+        params.append(int(member_id))
+    query += " ORDER BY l.loan_date DESC,l.id DESC"
+    return read_sql(query, params)
+
+
+def admin_review_member_loan_request(loan_id, decision, reservation=""):
+    """Traite une demande membre : soumission aux votes, réserves/refus ou confirmation directe."""
+    loan_id = safe_int_id(loan_id)
+    decision = str(decision or "").strip()
+    reservation = str(reservation or "").strip()
+    if loan_id is None:
+        raise ValueError("Demande invalide.")
+    allowed = {"Soumettre aux votes", "Mettre en réserve", "Refuser", "Confirmer directement"}
+    if decision not in allowed:
+        raise ValueError("Décision administrative invalide.")
+    lt = _table("loans")
+    with db() as con:
+        row = con.execute(f"SELECT id,status FROM {lt} WHERE id=? LIMIT 1", (loan_id,)).fetchone()
+        if not row:
+            raise ValueError("Demande introuvable.")
+        if str(row["status"]) not in {"Demande membre", "Réserves administratives"}:
+            raise ValueError("Cette demande a déjà été traitée.")
+        if decision in {"Mettre en réserve", "Refuser", "Confirmer directement"} and not reservation:
+            raise ValueError("Indiquez une remarque ou une réserve administrative.")
+
+        if decision == "Soumettre aux votes":
+            con.execute(
+                f"UPDATE {lt} SET status='En attente de validation', admin_approval_reason=?, admin_approved=FALSE, admin_approved_at=NULL WHERE id=?",
+                (reservation or "Demande validée par l'administration et soumise aux membres.", loan_id),
+            )
+        elif decision == "Mettre en réserve":
+            con.execute(
+                f"UPDATE {lt} SET status='Réserves administratives', admin_approval_reason=?, admin_approved=FALSE, admin_approved_at=NULL WHERE id=?",
+                (reservation, loan_id),
+            )
+        elif decision == "Refuser":
+            con.execute(
+                f"UPDATE {lt} SET status='Refusé', admin_approval_reason=?, admin_approved=FALSE, admin_approved_at=NULL WHERE id=?",
+                (reservation, loan_id),
+            )
+        else:
+            if use_supabase():
+                con.execute(
+                    f"UPDATE {lt} SET status='Confirmé', admin_approved=TRUE, admin_approval_reason=?, admin_approved_at=NOW() WHERE id=?",
+                    (reservation, loan_id),
+                )
+            else:
+                con.execute(
+                    f"UPDATE {lt} SET status='Confirmé', admin_approved=1, admin_approval_reason=?, admin_approved_at=datetime('now') WHERE id=?",
+                    (reservation, loan_id),
+                )
+        con.commit()
+    if decision == "Soumettre aux votes":
+        ensure_loan_votes(loan_id)
+        _, status = loan_vote_status(loan_id)
+        with db() as con:
+            con.execute(f"UPDATE {lt} SET status=? WHERE id=?", (status, loan_id))
+            con.commit()
+    refresh_application_data()
+
+
+def request_installments(loan_id):
+    """Retourne l'échéancier proposé pour une demande membre."""
+    return get_installments(loan_id)
+
+
 def member_account_page(member_id):
     data = member_account_data(member_id)
     if data["member"].empty:
         st.error("Compte membre introuvable.")
         return
     name = str(data["member"].iloc[0]["full_name"])
-    brand_hero("Mon espace membre", f"Bienvenue {name}. Retrouvez vos opérations, vos rappels et participez aux validations.", compact=True)
+    brand_hero("Mon espace membre", f"Bienvenue {name}. Retrouvez vos opérations, vos demandes d'emprunt, vos rappels et les validations.", compact=True)
 
-    c1, c2, c3, c4 = st.columns(4)
+    contribution_state = monthly_contribution_status(member_id)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total cotisé", money(data["total_contributed"]))
     c2.metric("Total emprunté", money(data["total_borrowed"]))
     c3.metric("Remboursements reçus", money(data["total_received"]))
     c4.metric("Reste à payer", money(data["outstanding"]))
+    c5.metric(f"Cotisation {contribution_state['month']}", contribution_state["status"])
+    if contribution_state["status"] == "À jour":
+        st.success(f"✅ Vous êtes à jour pour {contribution_state['month']} : {money(contribution_state['paid'])} versés sur {money(contribution_state['target'])}.")
+    elif contribution_state["status"] == "Non à jour":
+        st.warning(f"⚠️ Cotisation {contribution_state['month']} : {money(contribution_state['paid'])} versés sur {money(contribution_state['target'])}. Il reste {money(max(contribution_state['target']-contribution_state['paid'],0))}.")
+    else:
+        st.info("ℹ️ Aucun objectif mensuel n'est actuellement défini pour votre compte.")
 
     reminders = get_member_reminders(member_id)
     messages = get_member_messages(member_id)
     votes = loan_votes_for_member(member_id)
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "💰 Mes cotisations", "💳 Mes emprunts", "📅 Mes échéances",
-        "🔔 Mes rappels", "💬 Messages & réclamations", "🗳️ Votes / droit de veto",
-        "🔐 Mon accès"
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+        "💰 Mes cotisations", "💳 Mes emprunts", "📅 Mes échéances", "📝 Demander un emprunt",
+        "🔔 Mes rappels", "💬 Messages & réclamations", "🗳️ Votes / droit de veto", "🔐 Mon accès"
     ])
     with tab1:
         st.dataframe(data["contributions"], use_container_width=True, hide_index=True)
     with tab2:
-        st.dataframe(data["loans"], use_container_width=True, hide_index=True)
+        if data["loans"].empty:
+            st.info("Aucun emprunt confirmé.")
+        else:
+            st.dataframe(data["loans"], use_container_width=True, hide_index=True)
+        if not data["requests"].empty:
+            st.subheader("📨 État de mes demandes d'emprunt")
+            for _, req in data["requests"].iterrows():
+                with st.container(border=True):
+                    st.markdown(f"**Demande #{int(req['id'])} — {money(req['principal'])} — {req['status']}**")
+                    st.caption(f"Soumise le : {req['loan_date']} · {int(req['duration_months'])} échéance(s)")
+                    if req.get("admin_approval_reason"):
+                        st.info(f"Administration : {req['admin_approval_reason']}")
+                    rdf = request_installments(int(req["id"]))
+                    if not rdf.empty:
+                        show = rdf.rename(columns={"installment_number":"Échéance #","due_date":"Date prévue","amount_due":"Somme prévue"})
+                        show["Somme prévue"] = show["Somme prévue"].map(money)
+                        st.dataframe(show[["Échéance #","Date prévue","Somme prévue"]], use_container_width=True, hide_index=True)
+
     with tab3:
         st.dataframe(data["installments"], use_container_width=True, hide_index=True)
 
     with tab4:
+        st.subheader("📄 Soumettre une demande d'emprunt")
+        st.info("Proposez le montant que vous souhaitez emprunter ainsi que les dates et sommes de chaque échéance. L'administration examinera ensuite votre proposition et pourra la soumettre aux membres, demander des modifications/réserves ou la confirmer.")
+        with st.form("member_loan_request_form"):
+            request_amount = st.number_input("Montant souhaité", min_value=1.0, step=1000.0, key="member_request_amount")
+            request_count = st.number_input("Nombre d'échéances", min_value=1, max_value=60, value=1, step=1, key="member_request_count")
+            request_start = st.date_input("Date de la première échéance", value=date.today(), key="member_request_start")
+            request_note = st.text_area("Motif / remarque (facultatif)", key="member_request_note", height=90)
+            st.markdown("**Échéancier proposé**")
+            installment_inputs = []
+            default_each = request_amount / max(int(request_count), 1)
+            for i in range(int(request_count)):
+                dcol, acol = st.columns(2)
+                with dcol:
+                    dval = st.date_input(f"Échéance #{i+1} — date", value=add_months(request_start, i), key=f"member_req_date_{i}")
+                with acol:
+                    if i == int(request_count) - 1:
+                        prior_key = f"member_req_amount_prior_{i}"
+                    aval = st.number_input(f"Échéance #{i+1} — somme", min_value=0.01, value=float(round(default_each, 2)), step=500.0, key=f"member_req_amount_{i}")
+                installment_inputs.append({"due_date": dval, "amount": aval})
+            submit_request = st.form_submit_button("📨 Envoyer ma demande à l'administration", type="primary")
+            if submit_request:
+                try:
+                    loan_id = submit_member_loan_request(member_id, date.today(), request_amount, installment_inputs, request_note)
+                    st.success(f"Demande #{loan_id} envoyée à l'administration. Elle reste en attente de décision tant qu'elle n'est pas validée.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+        st.divider()
+        st.subheader("📌 Mes demandes en cours")
+        current_requests = member_loan_requests(member_id)
+        if current_requests.empty:
+            st.info("Aucune demande d'emprunt en attente.")
+        else:
+            for _, req in current_requests.iterrows():
+                st.write(f"**#{int(req['id'])} — {money(req['principal'])} — {req['status']}**")
+
+    with tab5:
         if reminders.empty:
             st.info("Aucun rappel pour le moment.")
         else:
@@ -1854,28 +2096,18 @@ def member_account_page(member_id):
                     if bool(r.get("whatsapp_sent")):
                         st.caption("📱 Rappel également envoyé sur WhatsApp.")
 
-    with tab5:
+    with tab6:
         st.subheader("✉️ Écrire à l'administration")
         with st.form("member_message_form"):
             subject = st.text_input("Objet", placeholder="Question, remarque, demande...")
             msg_type = st.selectbox("Type", ["Message", "Réclamation"])
             message = st.text_area("Votre message", height=150)
-            attachment = st.file_uploader(
-                "📎 Joindre une photo, un PDF ou un document Word (facultatif, 10 Mo max)",
-                type=["png", "jpg", "jpeg", "webp", "pdf", "doc", "docx"],
-                key="member_message_attachment",
-            )
+            attachment = st.file_uploader("📎 Joindre une photo, un PDF ou un document Word (facultatif, 10 Mo max)", type=["png", "jpg", "jpeg", "webp", "pdf", "doc", "docx"], key="member_message_attachment")
             send = st.form_submit_button("📨 Envoyer")
             if send:
                 try:
                     attachment_bytes = attachment.getvalue() if attachment is not None else None
-                    send_member_message_to_admin(
-                        member_id, subject, message,
-                        "reclamation" if msg_type == "Réclamation" else "message",
-                        attachment_name=attachment.name if attachment is not None else None,
-                        attachment_mime=attachment.type if attachment is not None else None,
-                        attachment_data=attachment_bytes,
-                    )
+                    send_member_message_to_admin(member_id, subject, message, "reclamation" if msg_type == "Réclamation" else "message", attachment_name=attachment.name if attachment is not None else None, attachment_mime=attachment.type if attachment is not None else None, attachment_data=attachment_bytes)
                     st.success("Votre message a été transmis à l'administration.")
                     st.rerun()
                 except Exception as exc:
@@ -1896,24 +2128,16 @@ def member_account_page(member_id):
                     if isinstance(_att_data, memoryview):
                         _att_data = _att_data.tobytes()
                     elif not isinstance(_att_data, (bytes, bytearray)):
-                        try:
-                            _att_data = bytes(_att_data)
-                        except Exception:
-                            _att_data = None
+                        try: _att_data = bytes(_att_data)
+                        except Exception: _att_data = None
                     if _att_data:
-                        st.download_button(
-                            "📎 Télécharger la pièce jointe",
-                            data=_att_data,
-                            file_name=str(r.get("attachment_name")),
-                            mime=str(r.get("attachment_mime") or "application/octet-stream"),
-                            key=f"member_attachment_{int(r['id'])}",
-                        )
+                        st.download_button("📎 Télécharger la pièce jointe", data=_att_data, file_name=str(r.get("attachment_name")), mime=str(r.get("attachment_mime") or "application/octet-stream"), key=f"member_attachment_{int(r['id'])}")
                 st.caption(str(r["created_at"]))
                 if not bool(r["is_read"]):
                     mark_message_read(r["id"])
 
-    with tab6:
-        st.info("Chaque membre actif, sauf le bénéficiaire, dispose d'un vote sur les nouveaux prêts. Un veto bloque la confirmation du prêt.")
+    with tab7:
+        st.info("Chaque membre actif, sauf le bénéficiaire, dispose d'un vote sur les prêts soumis. Un veto bloque la confirmation du prêt.")
         if votes.empty:
             st.success("Aucun prêt d'un autre membre ne vous attend actuellement.")
         else:
@@ -1940,8 +2164,7 @@ def member_account_page(member_id):
                         if r.get("comment"):
                             st.caption(f"Commentaire : {r['comment']}")
 
-
-    with tab7:
+    with tab8:
         st.subheader("🔐 Modifier mes identifiants")
         st.info("Pour changer vous-même votre accès, vous devez d'abord confirmer votre mot de passe actuel. Votre nouvel identifiant doit être unique.")
         current_username = str(data["member"].iloc[0].get("member_username") or "")
@@ -1963,7 +2186,6 @@ def member_account_page(member_id):
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
-
 
 
 # ============================================================
@@ -4470,6 +4692,53 @@ elif page == "Emprunts":
                     st.rerun()
                 except Exception as exc:
                     st.error(str(exc))
+
+        st.divider()
+        request_df = member_loan_requests()
+        st.subheader("📨 Demandes d'emprunt soumises par les membres")
+        if request_df.empty:
+            st.info("Aucune demande d'emprunt membre en attente de traitement.")
+        else:
+            request_options = {
+                f"#{safe_int_id(r['id'])} — {r['full_name']} — {money(r['principal'])} — {r['status']}": safe_int_id(r['id'])
+                for _, r in request_df.iterrows() if safe_int_id(r.get('id')) is not None
+            }
+            selected_request_label = st.selectbox("Demande à examiner", list(request_options.keys()), key="admin_member_loan_request_select")
+            selected_request_id = request_options[selected_request_label]
+            request_row = request_df[request_df['id'].map(safe_int_id) == selected_request_id].iloc[0]
+            st.markdown(f"**Membre :** {request_row['full_name']} · **Montant :** {money(request_row['principal'])} · **Échéances :** {int(request_row['duration_months'])}")
+            if request_row.get('note'):
+                st.caption(f"Motif du membre : {request_row['note']}")
+            req_idf = get_installments(selected_request_id).copy()
+            if not req_idf.empty:
+                req_idf['Statut'] = [installment_status(r['due_date'], r['amount_due'], r['amount_paid']) for _, r in req_idf.iterrows()]
+                req_show = req_idf.rename(columns={'installment_number':'Échéance #','due_date':'Date proposée','amount_due':'Somme proposée'})
+                req_show['Somme proposée'] = req_show['Somme proposée'].map(money)
+                st.dataframe(req_show[['Échéance #','Date proposée','Somme proposée','Statut']], use_container_width=True, hide_index=True)
+
+            with st.form(f"admin_review_member_request_form_{selected_request_id}"):
+                review_decision = st.selectbox(
+                    "Décision administrative",
+                    ["Soumettre aux votes", "Mettre en réserve", "Refuser", "Confirmer directement"],
+                    key=f"admin_review_decision_{selected_request_id}"
+                )
+                review_note = st.text_area(
+                    "Réserves / remarques / conditions de l'administration",
+                    value=str(request_row.get('admin_approval_reason') or ''),
+                    placeholder="Ex. modifier la date, réduire le montant, préciser une condition…",
+                    height=100,
+                    key=f"admin_review_note_{selected_request_id}"
+                )
+                review_submit = st.form_submit_button("💾 Enregistrer la décision", type="primary")
+                if review_submit:
+                    try:
+                        admin_review_member_loan_request(selected_request_id, review_decision, review_note)
+                        st.success("Décision administrative enregistrée.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
+            st.caption("Après « Soumettre aux votes », le prêt rejoint le circuit de validation/veto déjà présent dans l'application. « Confirmer directement » utilise la décision administrative exceptionnelle existante.")
 
         st.divider()
         ldf = loans()
