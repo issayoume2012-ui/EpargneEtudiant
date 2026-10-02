@@ -4584,80 +4584,85 @@ st.markdown(
 )
 
 if user_role == "member":
-    # Espace membre : navigation latérale fixe et guide intégré.
+    # Espace membre : navigation supérieure fixe, sans barre latérale.
     st.markdown(
         """
         <style>
-        [data-testid="stSidebar"] {
-            display: block !important;
-            visibility: visible !important;
-            width: 290px !important;
-            min-width: 290px !important;
-            background: linear-gradient(180deg, #122A55 0%, #1D3B68 65%, #274C79 100%) !important;
-        }
-        [data-testid="stSidebar"] > div:first-child {
-            width: 290px !important;
-        }
-        [data-testid="stSidebar"] * { color: white !important; }
-        [data-testid="stSidebar"] .stRadio label {
-            border-radius: 12px !important;
-            padding: 9px 10px !important;
-            margin: 2px 0 !important;
-        }
-        [data-testid="stSidebar"] .stRadio label:hover {
-            background: rgba(255,255,255,.10) !important;
-        }
-        .member-guide {
-            border: 1px solid rgba(255,255,255,.18);
-            border-radius: 14px;
-            padding: 12px;
-            margin-top: 14px;
-            background: rgba(255,255,255,.08);
-            font-size: .82rem;
-            line-height: 1.45;
-        }
-        .member-guide strong { color: #A9D4F5 !important; }
+        [data-testid="stSidebar"] { display:none !important; }
+        [data-testid="stAppViewContainer"] > .main { margin-left:0 !important; }
+        [data-testid="stHeader"] { background: transparent !important; }
+        .member-topbar { position: sticky; top: 0; z-index: 999; width: 100%; background: rgba(255,255,255,.97); border: 1px solid #dbe7f3; border-radius: 0 0 18px 18px; box-shadow: 0 8px 24px rgba(18,42,85,.10); padding: 12px 16px 10px 16px; margin-bottom: 20px; backdrop-filter: blur(12px); }
+        .member-brand { display:flex; align-items:center; gap:10px; min-height:46px; }
+        .member-brand-icon { width:42px; height:42px; border-radius:13px; display:flex; align-items:center; justify-content:center; background:linear-gradient(135deg,#0d6efd,#174ea6); color:#fff; font-size:21px; box-shadow:0 6px 16px rgba(13,110,253,.25); }
+        .member-brand-name { font-weight:800; color:#122a55; font-size:1rem; line-height:1.1; }
+        .member-brand-sub { color:#64748b; font-size:.72rem; margin-top:3px; }
+        .member-profile { display:flex; align-items:center; justify-content:flex-end; gap:9px; min-height:46px; }
+        .member-avatar { width:40px; height:40px; border-radius:50%; display:flex; align-items:center; justify-content:center; background:#e7f1ff; border:2px solid #c8ddf7; color:#174ea6; font-weight:800; font-size:16px; }
+        .member-profile-name { color:#122a55; font-weight:800; font-size:.82rem; text-align:right; }
+        .member-profile-role { color:#64748b; font-size:.68rem; text-align:right; margin-top:2px; }
+        .member-guide-top { background:linear-gradient(135deg,#f0f7ff,#f8fbff); border:1px solid #d7e7f6; border-radius:13px; padding:9px 12px; margin-top:9px; color:#475569; font-size:.76rem; line-height:1.4; }
+        .member-guide-top strong { color:#174ea6; }
+        @media (max-width: 900px) { .member-topbar { padding:10px; border-radius:0 0 14px 14px; } .member-profile { justify-content:flex-start; margin-top:7px; } .member-profile-name, .member-profile-role { text-align:left; } }
         </style>
         """,
         unsafe_allow_html=True,
     )
-    with st.sidebar:
-        st.markdown("### 👤 Mon espace membre")
-        st.caption(f"Bienvenue, {safe_display_text(st.session_state.user.get('full_name', 'Membre'))}")
-        member_pages = [
-            "💰 Mes cotisations",
-            "💳 Mes emprunts",
-            "📅 Mes échéances",
-            "📝 Demander un emprunt",
-            "🔔 Mes rappels",
-            "💬 Messages & réclamations",
-            "🗳️ Votes / droit de veto",
-            "🔐 Mon accès",
-            "❓ Guide d'utilisation",
-        ]
-        member_page = st.radio("Fonctions", member_pages, index=0, key="member_sidebar_page")
+
+    member_pages = [
+        "🏠 Accueil", "💰 Mes cotisations", "💳 Mes emprunts", "📅 Mes échéances",
+        "📝 Demander un emprunt", "🔔 Mes rappels", "💬 Messages & réclamations",
+        "🗳️ Votes / droit de veto", "🔐 Mon accès", "❓ Guide",
+    ]
+    member_page_map = {
+        "🏠 Accueil": "member_tab_1", "💰 Mes cotisations": "member_tab_1",
+        "💳 Mes emprunts": "member_tab_2", "📅 Mes échéances": "member_tab_3",
+        "📝 Demander un emprunt": "member_tab_4", "🔔 Mes rappels": "member_tab_5",
+        "💬 Messages & réclamations": "member_tab_6", "🗳️ Votes / droit de veto": "member_tab_7",
+        "🔐 Mon accès": "member_tab_8", "❓ Guide": "member_guide",
+    }
+
+    current_member_name = safe_display_text(st.session_state.user.get("full_name", "Membre"))
+    initials = "".join([part[:1] for part in current_member_name.split()[:2]]).upper() or "M"
+
+    st.markdown('<div class="member-topbar">', unsafe_allow_html=True)
+    brand_col, profile_col = st.columns([2.5, 1.5], vertical_alignment="center")
+    with brand_col:
         st.markdown(
             """
-            <div class="member-guide">
-                <strong>📘 Guide rapide</strong><br>
-                <b>Mes cotisations</b> : consultez vos versements et votre état mensuel.<br>
-                <b>Mes emprunts</b> : suivez les prêts confirmés et les décisions administratives.<br>
-                <b>Mes échéances</b> : consultez les dates, paiements et montants restants.<br>
-                <b>Demander un emprunt</b> : envoyez un montant et un échéancier proposés.<br>
-                <b>Messages</b> : contactez l'administration et envoyez une réclamation.<br>
-                <b>Votes</b> : votez sur les prêts qui vous sont soumis ou exercez votre veto.<br>
-                <b>Mon accès</b> : modifiez vos identifiants après vérification du mot de passe actuel.
-            </div>
+            <div class="member-brand"><div class="member-brand-icon">🐷</div><div>
+            <div class="member-brand-name">Épargne Étudiant</div>
+            <div class="member-brand-sub">Votre espace personnel d'épargne et de suivi</div>
+            </div></div>
             """,
             unsafe_allow_html=True,
         )
-        st.divider()
-        if st.button("🔄 Actualiser", use_container_width=True, key="member_sidebar_refresh"):
+    with profile_col:
+        st.markdown(
+            f'''<div class="member-profile"><div><div class="member-profile-name">{current_member_name}</div><div class="member-profile-role">👤 Membre connecté</div></div><div class="member-avatar">{safe_display_text(initials)}</div></div>''',
+            unsafe_allow_html=True,
+        )
+
+    member_page = st.radio("Navigation membre", member_pages, horizontal=True, label_visibility="collapsed", key="member_top_navigation")
+
+    action_col1, action_col2, action_col3, action_col4 = st.columns([1.05, 1.05, 1.05, 5.85])
+    with action_col1:
+        if st.button("🔄 Actualiser", use_container_width=True, key="member_top_refresh"):
             refresh_application_data(); st.rerun()
-        if st.button("↪ Déconnexion", use_container_width=True, key="member_sidebar_logout"):
-            audit_log("Déconnexion", "session", None, "Déconnexion membre")
-            clear_auth_session(); st.rerun()
+    with action_col2:
+        if st.button("👤 Profil", use_container_width=True, key="member_top_profile"):
+            st.session_state["member_requested_section"] = "member_tab_8"; st.rerun()
+    with action_col3:
+        if st.button("↪ Sortir", use_container_width=True, key="member_top_logout"):
+            audit_log("Déconnexion", "session", None, "Déconnexion membre"); clear_auth_session(); st.rerun()
+    with action_col4:
+        st.markdown(
+            """<div class="member-guide-top"><strong>📘 Guide rapide :</strong> Cotisations pour vos versements · Emprunts pour vos demandes et décisions · Échéances pour vos remboursements · Messages pour contacter l'administration · Votes pour les demandes soumises aux membres · Profil pour gérer votre accès.</div>""",
+            unsafe_allow_html=True,
+        )
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.session_state["member_requested_section"] = member_page_map.get(member_page, "member_tab_1")
     page = "Mon compte"
+
 else:
     # Administration : barre supérieure conservée, sans panneau latéral.
     st.markdown(
@@ -4702,23 +4707,6 @@ else:
             clear_auth_session(); st.rerun()
     st.caption("🟢 Supabase PostgreSQL connecté" if use_supabase() else "🔴 Supabase PostgreSQL non configuré")
     st.markdown('</div>', unsafe_allow_html=True)
-
-# Traduction des fonctions de la barre membre vers la page historique existante.
-if user_role == "member":
-    member_page_map = {
-        "💰 Mes cotisations": "member_tab_1",
-        "💳 Mes emprunts": "member_tab_2",
-        "📅 Mes échéances": "member_tab_3",
-        "📝 Demander un emprunt": "member_tab_4",
-        "🔔 Mes rappels": "member_tab_5",
-        "💬 Messages & réclamations": "member_tab_6",
-        "🗳️ Votes / droit de veto": "member_tab_7",
-        "🔐 Mon accès": "member_tab_8",
-        "❓ Guide d'utilisation": "member_guide",
-    }
-    st.session_state["member_requested_section"] = member_page_map.get(member_page, "member_tab_1")
-
-
 
 # ============================================================
 # TABLEAU DE BORD
