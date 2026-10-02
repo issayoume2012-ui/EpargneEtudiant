@@ -1397,6 +1397,115 @@ def ensure_loan_admin_columns():
             con.commit()
 
 
+def ensure_audit_schema():
+    """Crée le journal d'audit de l'application de façon idempotente."""
+    try:
+        if use_supabase():
+            with db() as con:
+                con.execute("""
+                    CREATE TABLE IF NOT EXISTS public.audit_logs (
+                        id BIGSERIAL PRIMARY KEY,
+                        actor_id BIGINT,
+                        actor_name TEXT,
+                        actor_role TEXT,
+                        action TEXT NOT NULL,
+                        entity_type TEXT,
+                        entity_id TEXT,
+                        details TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                con.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON public.audit_logs(created_at DESC)")
+                con.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_actor ON public.audit_logs(actor_id, actor_role)")
+                con.commit()
+        else:
+            with db() as con:
+                con.execute("""
+                    CREATE TABLE IF NOT EXISTS audit_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        actor_id INTEGER,
+                        actor_name TEXT,
+                        actor_role TEXT,
+                        action TEXT NOT NULL,
+                        entity_type TEXT,
+                        entity_id TEXT,
+                        details TEXT,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    )
+                """)
+                con.commit()
+    except Exception:
+        # Le journal ne doit jamais rendre l'application inutilisable.
+        pass
+
+
+def audit_log(action, entity_type="", entity_id=None, details="", actor=None):
+    """Enregistre une action sans jamais enregistrer de mot de passe ou secret."""
+    try:
+        actor = actor or st.session_state.get("user") or {}
+        actor_id = safe_int_id(actor.get("id")) if isinstance(actor, dict) else None
+        actor_name = str(actor.get("full_name") or actor.get("username") or "Système") if isinstance(actor, dict) else "Système"
+        actor_role = str(actor.get("role") or "system") if isinstance(actor, dict) else "system"
+        table = "public.audit_logs" if use_supabase() else "audit_logs"
+        clean_details = str(details or "").strip()
+        if len(clean_details) > 4000:
+            clean_details = clean_details[:4000] + "…"
+        with db() as con:
+            con.execute(
+                f"INSERT INTO {table} (actor_id,actor_name,actor_role,action,entity_type,entity_id,details) VALUES (?,?,?,?,?,?,?)",
+                (actor_id, actor_name, actor_role, str(action or "Action"), str(entity_type or ""),
+                 None if entity_id is None else str(entity_id), clean_details or None),
+            )
+            con.commit()
+    except Exception:
+        pass
+
+
+def get_audit_logs(limit=500, search_text=""):
+    table = "public.audit_logs" if use_supabase() else "audit_logs"
+    limit = max(1, min(int(limit or 500), 5000))
+    query = f"""SELECT id,created_at,actor_name,actor_role,action,entity_type,entity_id,details
+                FROM {table}"""
+    params = []
+    if str(search_text or "").strip():
+        op = "ILIKE" if use_supabase() else "LIKE"
+        query += f" WHERE actor_name {op} ? OR action {op} ? OR entity_type {op} ? OR details {op} ?"
+        q = f"%{str(search_text).strip()}%"
+        params = [q, q, q, q]
+    query += f" ORDER BY created_at DESC, id DESC LIMIT {limit}"
+    return read_sql(query, params)
+
+
+def audit_admin_action_page():
+    brand_hero("Audits", "Journal chronologique des actions effectuées dans l'application.", compact=True)
+    st.info("Le journal enregistre les opérations importantes : connexions, créations, modifications, suppressions, décisions administratives, votes, messages, rappels et changements d'accès. Les mots de passe et secrets ne sont jamais enregistrés.")
+    a1, a2, a3 = st.columns([2, 1, 1])
+    with a1:
+        audit_search = st.text_input("🔎 Rechercher dans les audits", placeholder="Nom, action, opération, membre…", key="audit_search")
+    with a2:
+        audit_limit = st.selectbox("Nombre de lignes", [100, 250, 500, 1000, 2500], index=2, key="audit_limit")
+    with a3:
+        if st.button("🔄 Actualiser les audits", use_container_width=True, key="audit_refresh"):
+            st.rerun()
+    adf = get_audit_logs(audit_limit, audit_search)
+    if adf.empty:
+        st.info("Aucune action enregistrée pour ces critères.")
+    else:
+        display = adf.rename(columns={
+            "id":"ID", "created_at":"Date / heure", "actor_name":"Utilisateur",
+            "actor_role":"Rôle", "action":"Action", "entity_type":"Objet",
+            "entity_id":"ID objet", "details":"Détails"
+        })
+        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.download_button(
+            "📥 Télécharger les audits en CSV",
+            data=display.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"audits_epargne_{date.today().isoformat()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+
 @st.cache_resource(show_spinner=False)
 def init_db(config_fingerprint=None):
     """Initialise exclusivement Supabase PostgreSQL."""
@@ -1405,6 +1514,7 @@ def init_db(config_fingerprint=None):
     ensure_loan_admin_columns()
     ensure_member_access_requests_table()
     ensure_communication_schema()
+    ensure_audit_schema()
     # La migration SQLite historique est désactivée par défaut : elle peut
     # ralentir inutilement chaque nouveau déploiement. Elle reste disponible
     # si l'administrateur définit explicitement MIGRATE_SQLITE_TO_SUPABASE=1.
@@ -1626,6 +1736,7 @@ def set_member_login(member_id, username, password, active=True):
             (username, password, bool(active), member_id),
         )
         con.commit()
+    audit_log("Création / mise à jour du compte membre", "member", member_id, f"Identifiant membre mis à jour; actif={bool(active)}")
 
 
 def change_member_credentials(member_id, current_password, new_username, new_password):
@@ -1665,6 +1776,7 @@ def change_member_credentials(member_id, current_password, new_username, new_pas
             (new_username, new_password, member_id),
         )
         con.commit()
+    audit_log("Modification des identifiants membre", "member", member_id, "Identifiants modifiés par le membre")
     try:
         member_account_data_cached.clear()
     except Exception:
@@ -1716,6 +1828,7 @@ def create_member_access_request(submitted_name, submitted_phone="", submitted_u
             (member_id, name, phone or None, username or None, reason or None),
         )
         con.commit()
+    audit_log("Demande de récupération d'accès", "member_access_request", member_id, f"Demande soumise pour {name}")
 
 
 def get_member_access_requests(pending_only=False):
@@ -1768,6 +1881,7 @@ def resolve_member_access_request(request_id, member_id, new_username, new_passw
             (admin_note or None, member_id, request_id),
         )
         con.commit()
+    audit_log("Réinitialisation d'accès membre", "member_access_request", request_id, f"Accès réinitialisé pour le membre {member_id}")
     try:
         member_account_data_cached.clear()
     except Exception:
@@ -1917,6 +2031,7 @@ def submit_member_loan_request(member_id, loan_date, principal, installments, no
             )
         con.commit()
     refresh_application_data()
+    audit_log("Demande d'emprunt soumise", "loan", loan_id, f"Membre {member_id}; montant {money(principal)}; échéances {len(normalized)}")
     return loan_id
 
 
@@ -2034,6 +2149,7 @@ def admin_review_member_loan_request(loan_id, decision, approval_action=None, ju
         # C'est le seul endroit du circuit administratif qui crée les bulletins.
         ensure_loan_votes(loan_id)
     refresh_application_data()
+    audit_log("Décision administrative sur une demande d'emprunt", "loan", loan_id, f"Décision={decision}; mode={approval_action or 'désapprouvé'}; justification enregistrée={'oui' if justification else 'non'}")
 
 
 
@@ -2068,13 +2184,19 @@ def member_account_page(member_id):
     messages = get_member_messages(member_id)
     votes = loan_votes_for_member(member_id)
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-        "💰 Mes cotisations", "💳 Mes emprunts", "📅 Mes échéances", "📝 Demander un emprunt",
-        "🔔 Mes rappels", "💬 Messages & réclamations", "🗳️ Votes / droit de veto", "🔐 Mon accès"
-    ])
-    with tab1:
+    # Navigation fixe : la sélection de la barre latérale pilote la section affichée.
+    requested_section = st.session_state.get("member_requested_section", "member_tab_1")
+    section_titles = {
+        "member_tab_1": "💰 Mes cotisations", "member_tab_2": "💳 Mes emprunts",
+        "member_tab_3": "📅 Mes échéances", "member_tab_4": "📝 Demander un emprunt",
+        "member_tab_5": "🔔 Mes rappels", "member_tab_6": "💬 Messages & réclamations",
+        "member_tab_7": "🗳️ Votes / droit de veto", "member_tab_8": "🔐 Mon accès",
+        "member_guide": "❓ Guide d'utilisation"
+    }
+    st.markdown(f'<div class="section-title">{section_titles.get(requested_section, "Mon espace membre")}</div>', unsafe_allow_html=True)
+    if requested_section == "member_tab_1":
         st.dataframe(data["contributions"], use_container_width=True, hide_index=True)
-    with tab2:
+    if requested_section == "member_tab_2":
         if data["loans"].empty:
             st.info("Aucun emprunt confirmé.")
         else:
@@ -2113,12 +2235,12 @@ def member_account_page(member_id):
                         show["Somme prévue"] = show["Somme prévue"].map(money)
                         st.dataframe(show[["Échéance #","Date prévue","Somme prévue"]], use_container_width=True, hide_index=True)
 
-    with tab3:
+    if requested_section == "member_tab_3":
         st.dataframe(data["installments"], use_container_width=True, hide_index=True)
 
-    with tab4:
+    if requested_section == "member_tab_4":
         st.subheader("📄 Soumettre une demande d'emprunt")
-        st.info("Proposez le montant que vous souhaitez emprunter ainsi que les dates et sommes de chaque échéance. L'administration examinera ensuite votre proposition et pourra la soumettre aux membres, demander des modifications/réserves ou la confirmer.")
+        st.info("Proposez le montant que vous souhaitez emprunter ainsi que les dates et sommes de chaque échéance. L'administration examinera votre proposition. Si elle l'approuve, elle choisira explicitement soit une soumission aux votes, soit une approbation exceptionnelle sans vote.")
         with st.form("member_loan_request_form"):
             request_amount = st.number_input("Montant souhaité", min_value=1.0, step=1000.0, key="member_request_amount")
             request_count = st.number_input("Nombre d'échéances", min_value=1, max_value=60, value=1, step=1, key="member_request_count")
@@ -2157,7 +2279,7 @@ def member_account_page(member_id):
                 if current_reason:
                     st.caption(f"👤 Avis de l'administration : {current_reason}")
 
-    with tab5:
+    if requested_section == "member_tab_5":
         if reminders.empty:
             st.info("Aucun rappel pour le moment.")
         else:
@@ -2170,7 +2292,7 @@ def member_account_page(member_id):
                     if bool(r.get("whatsapp_sent")):
                         st.caption("📱 Rappel également envoyé sur WhatsApp.")
 
-    with tab6:
+    if requested_section == "member_tab_6":
         st.subheader("✉️ Écrire à l'administration")
         with st.form("member_message_form"):
             subject = st.text_input("Objet", placeholder="Question, remarque, demande...")
@@ -2210,7 +2332,7 @@ def member_account_page(member_id):
                 if not bool(r["is_read"]):
                     mark_message_read(r["id"])
 
-    with tab7:
+    if requested_section == "member_tab_7":
         st.info("Chaque membre actif, sauf le bénéficiaire, dispose d'un vote sur les prêts soumis. Un veto bloque la confirmation du prêt.")
         if votes.empty:
             st.success("Aucun prêt d'un autre membre ne vous attend actuellement.")
@@ -2238,7 +2360,23 @@ def member_account_page(member_id):
                         if r.get("comment"):
                             st.caption(f"Commentaire : {r['comment']}")
 
-    with tab8:
+    if requested_section == "member_guide":
+        st.subheader("❓ Guide d'utilisation")
+        st.markdown("""
+        ### Bien utiliser votre espace membre
+        1. **Mes cotisations** — vérifiez vos versements et votre situation mensuelle.
+        2. **Mes emprunts** — consultez uniquement vos emprunts confirmés et les avis administratifs associés.
+        3. **Mes échéances** — consultez les montants prévus, payés et restant à payer.
+        4. **Demander un emprunt** — indiquez le montant demandé puis proposez chaque date et montant d'échéance.
+        5. **Mes rappels** — retrouvez les rappels liés à vos cotisations et remboursements.
+        6. **Messages & réclamations** — écrivez à l'administration et récupérez ses réponses/pièces jointes.
+        7. **Votes / droit de veto** — lorsqu'un prêt vous est soumis, choisissez **Approuvé** ou **Veto**, puis validez votre vote.
+        8. **Mon accès** — changez vos identifiants uniquement après avoir confirmé votre mot de passe actuel.
+        
+        **Sécurité :** vous ne pouvez consulter que les données liées à votre propre compte membre.
+        """)
+
+    if requested_section == "member_tab_8":
         st.subheader("🔐 Modifier mes identifiants")
         st.info("Pour changer vous-même votre accès, vous devez d'abord confirmer votre mot de passe actuel. Votre nouvel identifiant doit être unique.")
         current_username = str(data["member"].iloc[0].get("member_username") or "")
@@ -2425,7 +2563,9 @@ def add_member(name, phone, target, notes):
             raise RuntimeError("La base n'a pas confirmé l'enregistrement du membre.")
 
         con.commit()
-        return new_id
+    refresh_application_data()
+    audit_log("Création d'un membre", "member", new_id, f"Membre: {clean_name}")
+    return new_id
 
 
 def update_member(member_id, name, phone, target, notes, active):
@@ -2537,6 +2677,7 @@ def add_contribution(member_id, payment_date, amount, note):
             raise RuntimeError('La base n’a pas confirmé la cotisation.')
         con.commit()
     refresh_application_data()
+    audit_log("Création d'une cotisation", "contribution", contribution_id, f"Montant: {money(amount)}")
     return contribution_id
 
 
@@ -2555,6 +2696,7 @@ def update_contribution(contribution_id, payment_date, amount, note):
             raise ValueError("Cotisation introuvable.")
         con.commit()
     refresh_application_data()
+    audit_log("Modification d'une cotisation", "contribution", contribution_id, f"Montant: {money(amount)}")
 
 
 def delete_contribution(contribution_id):
@@ -2728,6 +2870,7 @@ def create_loan(
     # Un prêt créé directement par l'administration reste un prêt administratif
     # classique. Aucun bulletin n'est créé implicitement.
     refresh_application_data()
+    audit_log("Création d'un prêt", "loan", loan_id, f"Membre {member_id}; montant {money(principal)}")
     return loan_id
 
 
@@ -2778,6 +2921,7 @@ def update_loan(loan_id, member_id, loan_date, principal, rate, duration, first_
                     con.execute(f"UPDATE {it} SET amount_due=? WHERE id=?", (round(amt,2), r['id']))
         con.commit()
     refresh_application_data()
+    audit_log("Modification d'un prêt", "loan", loan_id, f"Membre {member_id}; montant {money(principal)}")
 
 
 def delete_loan(loan_id):
@@ -2797,6 +2941,7 @@ def delete_loan(loan_id):
         con.execute(f"DELETE FROM {lt} WHERE id=?", (loan_id,))
         con.commit()
     refresh_application_data()
+    audit_log("Suppression d'un prêt", "loan", loan_id, "Prêt, échéances et votes supprimés")
 
 
 def update_installment(installment_id, due_date, amount_due, amount_paid, payment_date, note):
@@ -2822,6 +2967,7 @@ def update_installment(installment_id, due_date, amount_due, amount_paid, paymen
         con.execute(f"UPDATE {lt} SET status=? WHERE id=?", (status, loan_id))
         con.commit()
     refresh_application_data()
+    audit_log("Modification d'une échéance", "loan_installment", installment_id, f"Montant prévu: {money(amount_due)}; payé: {money(amount_paid)}")
 
 def delete_installment(installment_id):
     """Supprime une échéance et recalcule le statut du prêt."""
@@ -2853,6 +2999,7 @@ def delete_installment(installment_id):
             con.execute(f"UPDATE {lt} SET status=? WHERE id=?", (status, loan_id))
         con.commit()
     refresh_application_data()
+    audit_log("Suppression d'une échéance", "loan_installment", installment_id, "Échéance supprimée")
 
 
 def loans(member_id=None, confirmed_only=False):
@@ -2939,6 +3086,7 @@ def register_installment_payment(
 
         con.commit()
     refresh_application_data()
+    audit_log("Enregistrement d'un remboursement", "loan_installment", installment_id, f"Montant payé: {money(amount_paid)}; statut prêt: {status}")
 
 
 
@@ -2976,6 +3124,7 @@ def create_member_message(member_id, message, subject="", message_type="message"
              bytes(attachment_data) if attachment_data is not None else None),
         )
         con.commit()
+    audit_log("Message envoyé à un membre" if sender_role == "admin" else "Message membre envoyé", "message", member_id, f"Type: {message_type}; Objet: {subject or 'Sans objet'}")
 
 
 def get_member_messages(member_id=None, unread_only=False):
@@ -3023,6 +3172,7 @@ def create_member_reminder(member_id, reminder_type, title, message, due_date=No
              due_date.isoformat() if due_date else None, bool(whatsapp_sent)),
         )
         con.commit()
+    audit_log("Rappel créé", "reminder", member_id, f"Type: {reminder_type}; titre: {title}")
 
 
 def get_member_reminders(member_id):
@@ -3188,6 +3338,7 @@ def cast_loan_vote(loan_id, voter_member_id, decision, comment=""):
         con.execute(f"UPDATE {lt} SET status=? WHERE id=?", (status_db, loan_id))
         con.commit()
     refresh_application_data()
+    audit_log("Vote sur un emprunt", "loan", loan_id, f"Vote={decision}; statut final={status}")
     return status
 
 
@@ -3234,6 +3385,7 @@ def admin_approve_loan(loan_id, reason=""):
             )
         con.commit()
     refresh_application_data()
+    audit_log("Approbation exceptionnelle d'un prêt", "loan", loan_id, "Prêt confirmé sans vote")
     return "Confirmé par l'administration"
 
 
@@ -3257,6 +3409,7 @@ def revoke_admin_loan_approval(loan_id):
         con.execute(f"UPDATE {lt} SET status=? WHERE id=?", (status, loan_id))
         con.commit()
     refresh_application_data()
+    audit_log("Retrait d'une approbation administrative", "loan", loan_id, f"Statut réévalué: {status}")
     return status
 
 
@@ -3461,6 +3614,7 @@ def add_admin(username, password, full_name):
             )
         )
         con.commit()
+    audit_log("Création d'un administrateur", "admin", None, f"Nom: {full_name.strip()}; identifiant: {username.strip()}")
 
 
 # ============================================================
@@ -4250,6 +4404,7 @@ if st.session_state.user is None:
                         if user:
                             user["role"] = "admin"
                             mark_authenticated(user)
+                            audit_log("Connexion", "session", user.get("id"), "Connexion administrateur réussie", actor=user)
                             st.rerun()
                         else:
                             register_failed_login()
@@ -4271,6 +4426,7 @@ if st.session_state.user is None:
                             st.error("Connexion membre impossible pour le moment. Réessayez.")
                             user = None
                         if user:
+                            audit_log("Connexion", "session", user.get("id"), "Connexion membre réussie", actor=user)
                             mark_authenticated(user)
                             st.rerun()
                         else:
@@ -4427,72 +4583,141 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="top-navigation">', unsafe_allow_html=True)
-
-brand_col, user_col = st.columns([2.4, 1.2], vertical_alignment="center")
-
-with brand_col:
+if user_role == "member":
+    # Espace membre : navigation latérale fixe et guide intégré.
     st.markdown(
         """
-        <div class="top-brand">
-            <div class="top-brand-icon">🐷</div>
-            <div>
-                <div class="top-brand-name">Épargne Étudiant</div>
-                <div class="top-brand-subtitle">Petits efforts, grands projets</div>
-            </div>
-        </div>
+        <style>
+        [data-testid="stSidebar"] {
+            display: block !important;
+            visibility: visible !important;
+            width: 290px !important;
+            min-width: 290px !important;
+            background: linear-gradient(180deg, #122A55 0%, #1D3B68 65%, #274C79 100%) !important;
+        }
+        [data-testid="stSidebar"] > div:first-child {
+            width: 290px !important;
+        }
+        [data-testid="stSidebar"] * { color: white !important; }
+        [data-testid="stSidebar"] .stRadio label {
+            border-radius: 12px !important;
+            padding: 9px 10px !important;
+            margin: 2px 0 !important;
+        }
+        [data-testid="stSidebar"] .stRadio label:hover {
+            background: rgba(255,255,255,.10) !important;
+        }
+        .member-guide {
+            border: 1px solid rgba(255,255,255,.18);
+            border-radius: 14px;
+            padding: 12px;
+            margin-top: 14px;
+            background: rgba(255,255,255,.08);
+            font-size: .82rem;
+            line-height: 1.45;
+        }
+        .member-guide strong { color: #A9D4F5 !important; }
+        </style>
         """,
         unsafe_allow_html=True,
     )
-
-with user_col:
-    safe_user_name = safe_display_text(st.session_state.user.get("full_name", "Utilisateur"))
+    with st.sidebar:
+        st.markdown("### 👤 Mon espace membre")
+        st.caption(f"Bienvenue, {safe_display_text(st.session_state.user.get('full_name', 'Membre'))}")
+        member_pages = [
+            "💰 Mes cotisations",
+            "💳 Mes emprunts",
+            "📅 Mes échéances",
+            "📝 Demander un emprunt",
+            "🔔 Mes rappels",
+            "💬 Messages & réclamations",
+            "🗳️ Votes / droit de veto",
+            "🔐 Mon accès",
+            "❓ Guide d'utilisation",
+        ]
+        member_page = st.radio("Fonctions", member_pages, index=0, key="member_sidebar_page")
+        st.markdown(
+            """
+            <div class="member-guide">
+                <strong>📘 Guide rapide</strong><br>
+                <b>Mes cotisations</b> : consultez vos versements et votre état mensuel.<br>
+                <b>Mes emprunts</b> : suivez les prêts confirmés et les décisions administratives.<br>
+                <b>Mes échéances</b> : consultez les dates, paiements et montants restants.<br>
+                <b>Demander un emprunt</b> : envoyez un montant et un échéancier proposés.<br>
+                <b>Messages</b> : contactez l'administration et envoyez une réclamation.<br>
+                <b>Votes</b> : votez sur les prêts qui vous sont soumis ou exercez votre veto.<br>
+                <b>Mon accès</b> : modifiez vos identifiants après vérification du mot de passe actuel.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.divider()
+        if st.button("🔄 Actualiser", use_container_width=True, key="member_sidebar_refresh"):
+            refresh_application_data(); st.rerun()
+        if st.button("↪ Déconnexion", use_container_width=True, key="member_sidebar_logout"):
+            audit_log("Déconnexion", "session", None, "Déconnexion membre")
+            clear_auth_session(); st.rerun()
+    page = "Mon compte"
+else:
+    # Administration : barre supérieure conservée, sans panneau latéral.
     st.markdown(
-        f'<div class="top-user">👤 <strong>{safe_user_name}</strong></div>',
+        """
+        <style>
+        [data-testid="stSidebar"] { display:none !important; }
+        [data-testid="stAppViewContainer"] > .main { margin-left:0 !important; }
+        </style>
+        """,
         unsafe_allow_html=True,
     )
-
-if user_role == "member":
-    page = "Mon compte"
-    st.info("👤 Espace membre — lecture seule")
-else:
+    st.markdown('<div class="top-navigation">', unsafe_allow_html=True)
+    brand_col, user_col = st.columns([2.4, 1.2], vertical_alignment="center")
+    with brand_col:
+        st.markdown(
+            """
+            <div class="top-brand">
+                <div class="top-brand-icon">🐷</div>
+                <div>
+                    <div class="top-brand-name">Épargne Étudiant</div>
+                    <div class="top-brand-subtitle">Petits efforts, grands projets</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with user_col:
+        safe_user_name = safe_display_text(st.session_state.user.get("full_name", "Administrateur"))
+        st.markdown(f'<div class="top-user">👤 <strong>{safe_user_name}</strong></div>', unsafe_allow_html=True)
     pages = [
-        "Tableau de bord",
-        "Membres",
-        "Cotisations",
-        "Emprunts",
-        "Rappels WhatsApp",
-        "Communication",
-        "Rapport global",
-        "Bulletins PDF",
-        "Administrateurs",
+        "Tableau de bord", "Membres", "Cotisations", "Emprunts", "Rappels WhatsApp",
+        "Communication", "Rapport global", "Bulletins PDF", "Administrateurs", "Audits"
     ]
+    page = st.radio("Menu principal", pages, horizontal=True, label_visibility="collapsed", key="top_navigation_page")
+    action_col1, action_col2, action_col3 = st.columns([1, 1, 5])
+    with action_col1:
+        if st.button("🔄 Actualiser", use_container_width=True, key="top_refresh"):
+            refresh_application_data(); st.rerun()
+    with action_col2:
+        if st.button("↪ Déconnexion", use_container_width=True, key="top_logout"):
+            audit_log("Déconnexion", "session", None, "Déconnexion administrateur")
+            clear_auth_session(); st.rerun()
+    st.caption("🟢 Supabase PostgreSQL connecté" if use_supabase() else "🔴 Supabase PostgreSQL non configuré")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    page = st.radio(
-        "Menu principal",
-        pages,
-        horizontal=True,
-        label_visibility="collapsed",
-        key="top_navigation_page",
-    )
+# Traduction des fonctions de la barre membre vers la page historique existante.
+if user_role == "member":
+    member_page_map = {
+        "💰 Mes cotisations": "member_tab_1",
+        "💳 Mes emprunts": "member_tab_2",
+        "📅 Mes échéances": "member_tab_3",
+        "📝 Demander un emprunt": "member_tab_4",
+        "🔔 Mes rappels": "member_tab_5",
+        "💬 Messages & réclamations": "member_tab_6",
+        "🗳️ Votes / droit de veto": "member_tab_7",
+        "🔐 Mon accès": "member_tab_8",
+        "❓ Guide d'utilisation": "member_guide",
+    }
+    st.session_state["member_requested_section"] = member_page_map.get(member_page, "member_tab_1")
 
-# Actions globales dans la barre supérieure.
-action_col1, action_col2, action_col3 = st.columns([1, 1, 5])
-with action_col1:
-    if st.button("🔄 Actualiser", use_container_width=True, key="top_refresh"):
-        refresh_application_data()
-        st.rerun()
-with action_col2:
-    if st.button("↪ Déconnexion", use_container_width=True, key="top_logout"):
-        clear_auth_session()
-        st.rerun()
-
-if use_supabase():
-    st.caption("🟢 Supabase PostgreSQL connecté")
-else:
-    st.caption("🔴 Supabase PostgreSQL non configuré")
-
-st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ============================================================
@@ -4804,12 +5029,14 @@ elif page == "Emprunts":
                     key=f"admin_review_decision_{selected_request_id}"
                 )
                 if review_decision == "Approuvé":
-                    review_action = st.radio(
-                        "Après l'approbation",
-                        ["Soumettre aux votes", "Approbation exceptionnelle"],
-                        horizontal=True,
+                    review_action = st.selectbox(
+                        "Après l'approbation — choisissez explicitement le circuit",
+                        ["— Choisir —", "Soumettre aux votes", "Approbation exceptionnelle"],
+                        index=0,
                         key=f"admin_review_action_{selected_request_id}"
                     )
+                    if review_action == "— Choisir —":
+                        review_action = None
                     note_label = (
                         "Motif de l'approbation exceptionnelle (obligatoire)"
                         if review_action == "Approbation exceptionnelle"
@@ -5295,6 +5522,10 @@ elif page == "Bulletins PDF":
 # ============================================================
 # ADMINISTRATEURS
 # ============================================================
+
+
+elif page == "Audits":
+    audit_admin_action_page()
 
 elif page == "Administrateurs":
 
