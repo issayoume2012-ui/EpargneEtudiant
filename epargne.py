@@ -7,6 +7,9 @@ from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
 import urllib.parse
+import urllib.request
+import urllib.error
+import json
 import html
 import time
 
@@ -56,6 +59,100 @@ def secret_or_env(name, default=""):
     except Exception:
         value = ""
     return value or os.getenv(name, default)
+
+
+# ============================================================
+# NOTIFICATIONS WHATSAPP ADMINISTRATEUR
+# ============================================================
+# Le numéro WHATSAPP ci-dessus reste la destination administrative.
+# Pour un envoi réellement automatique, renseignez dans Streamlit Secrets
+# ou les variables d'environnement :
+#   WHATSAPP_API_TOKEN
+#   WHATSAPP_PHONE_NUMBER_ID
+#   WHATSAPP_GRAPH_VERSION (facultatif, défaut v23.0)
+# L'application continue de fonctionner sans ces secrets : dans ce cas,
+# elle génère simplement un lien WhatsApp de secours.
+WHATSAPP_API_TOKEN = secret_or_env("WHATSAPP_API_TOKEN", "")
+WHATSAPP_PHONE_NUMBER_ID = secret_or_env("WHATSAPP_PHONE_NUMBER_ID", "")
+WHATSAPP_GRAPH_VERSION = secret_or_env("WHATSAPP_GRAPH_VERSION", "v23.0")
+
+
+def whatsapp_admin_notification(title, message):
+    """Envoie une notification automatique au WhatsApp de l'administration.
+
+    - Si Meta WhatsApp Cloud API est configurée : envoi serveur-à-serveur.
+    - Sinon : retour d'un lien wa.me de secours, sans bloquer l'opération métier.
+    - Une erreur WhatsApp ne fait jamais échouer l'enregistrement en base.
+    """
+    text = f"🔔 {title}\n\n{message}".strip()
+    admin_phone = normalize_phone(WHATSAPP)
+
+    if not WHATSAPP_API_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+        return {
+            "sent": False,
+            "mode": "link",
+            "url": whatsapp_link(admin_phone, text),
+            "error": "WHATSAPP_API_TOKEN / WHATSAPP_PHONE_NUMBER_ID non configurés.",
+        }
+
+    endpoint = (
+        f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/"
+        f"{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    )
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": admin_phone,
+        "type": "text",
+        "text": {"preview_url": False, "body": text[:4096]},
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {WHATSAPP_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            body = response.read().decode("utf-8", errors="replace")
+        return {"sent": True, "mode": "cloud_api", "response": body}
+    except urllib.error.HTTPError as exc:
+        try:
+            details = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            details = str(exc)
+        return {
+            "sent": False,
+            "mode": "cloud_api",
+            "url": whatsapp_link(admin_phone, text),
+            "error": f"WhatsApp API HTTP {exc.code}: {details[:1000]}",
+        }
+    except Exception as exc:
+        return {
+            "sent": False,
+            "mode": "cloud_api",
+            "url": whatsapp_link(admin_phone, text),
+            "error": str(exc)[:1000],
+        }
+
+
+def notify_admin_whatsapp(title, message):
+    """Journalise discrètement une tentative de notification sans casser l'application."""
+    try:
+        result = whatsapp_admin_notification(title, message)
+        status = "envoyée" if result.get("sent") else "non envoyée / lien de secours disponible"
+        audit_log(
+            "Notification WhatsApp administrateur",
+            "whatsapp_notification",
+            None,
+            f"{title}: {status}; mode={result.get('mode', 'inconnu')}",
+        )
+        return result
+    except Exception as exc:
+        # L'alerte WhatsApp ne doit jamais empêcher l'enregistrement métier.
+        return {"sent": False, "mode": "error", "error": str(exc)[:1000]}
 
 
 # Configuration Supabase / PostgreSQL.
@@ -1829,6 +1926,10 @@ def create_member_access_request(submitted_name, submitted_phone="", submitted_u
         )
         con.commit()
     audit_log("Demande de récupération d'accès", "member_access_request", member_id, f"Demande soumise pour {name}")
+    notify_admin_whatsapp(
+        "Nouvelle demande d'accès",
+        f"Membre : {name}\nTéléphone : {phone or 'non renseigné'}\nIdentifiant : {username or 'non renseigné'}\nMotif : {reason or 'non renseigné'}\n\nConnectez-vous à l'application pour traiter la demande.",
+    )
 
 
 def get_member_access_requests(pending_only=False):
@@ -2032,6 +2133,17 @@ def submit_member_loan_request(member_id, loan_date, principal, installments, no
         con.commit()
     refresh_application_data()
     audit_log("Demande d'emprunt soumise", "loan", loan_id, f"Membre {member_id}; montant {money(principal)}; échéances {len(normalized)}")
+    try:
+        member_row = read_sql(f"SELECT full_name, phone FROM {mt} WHERE id=? LIMIT 1", [member_id])
+        member_name = str(member_row.iloc[0]["full_name"]) if not member_row.empty else f"Membre #{member_id}"
+        member_phone = str(member_row.iloc[0]["phone"] or "") if not member_row.empty else ""
+    except Exception:
+        member_name = f"Membre #{member_id}"
+        member_phone = ""
+    notify_admin_whatsapp(
+        "Nouvelle demande de prêt",
+        f"Demande #{loan_id}\nMembre : {member_name}\nTéléphone : {member_phone or 'non renseigné'}\nMontant : {money(principal)}\nÉchéances : {len(normalized)}\nMotif : {str(note or '').strip() or 'non renseigné'}\n\nConnectez-vous à l'application pour examiner la demande.",
+    )
     return loan_id
 
 
@@ -3194,6 +3306,17 @@ def send_member_message_to_admin(member_id, subject, message, message_type="mess
         member_id, message, subject, message_type,
         sender_role="member", sender_member_id=member_id,
         attachment_name=attachment_name, attachment_mime=attachment_mime, attachment_data=attachment_data,
+    )
+    try:
+        member_row = read_sql(f"SELECT full_name, phone FROM {_table('members')} WHERE id=? LIMIT 1", [member_id])
+        member_name = str(member_row.iloc[0]["full_name"]) if not member_row.empty else f"Membre #{member_id}"
+        member_phone = str(member_row.iloc[0]["phone"] or "") if not member_row.empty else ""
+    except Exception:
+        member_name = f"Membre #{member_id}"
+        member_phone = ""
+    notify_admin_whatsapp(
+        "Nouveau message d'un membre",
+        f"Membre : {member_name}\nTéléphone : {member_phone or 'non renseigné'}\nType : {message_type}\nObjet : {str(subject or '').strip() or 'Sans objet'}\nMessage :\n{str(message).strip()}\n\nConnectez-vous à l'application pour répondre.",
     )
 
 
