@@ -928,6 +928,17 @@ def create_supabase_schema():
     """
     Prépare le schéma Supabase une seule fois par processus Streamlit.
 
+    Compatibilité avec le changement Supabase Data API annoncé pour le
+    30 octobre 2026 : cette application utilise une connexion PostgreSQL
+    directe via psycopg2 / ThreadedConnectionPool (voir db()), et non
+    supabase-js, PostgREST ou l'API Data pour ses opérations métier.
+    Les GRANT de l'API Data ne sont donc pas nécessaires au fonctionnement
+    de cette application. Les tables contiennent des données financières
+    et personnelles ; on n'accorde pas ici des droits API généraux à anon
+    ou authenticated. Si un accès API est ajouté ultérieurement, ses GRANT
+    devront être définis explicitement, au moindre privilège, avec les
+    politiques RLS appropriées, dans la migration qui crée chaque table.
+
     Correction importante :
     l'ancienne version créait l'index member_username AVANT d'ajouter
     member_username aux anciennes tables members. Si la table members
